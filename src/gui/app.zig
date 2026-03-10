@@ -793,20 +793,24 @@ fn drawCenteredTextColored(text: []const u8, color: [4]f32) void {
     zgui.textColored(color, "{s}", .{text});
 }
 
-fn buildParamSummary(allocator: std.mem.Allocator, params: []const config.ParameterConfig, buffer: []u8) []const u8 {
+fn appendUniqueParamNames(allocator: std.mem.Allocator, params: []const config.ParameterConfig, unique_names: *std.ArrayList([]const u8)) !void {
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
-
-    var unique_names = std.ArrayList([]const u8).init(allocator);
-    defer unique_names.deinit();
 
     for (params) |param| {
         if (param.name.len == 0) continue;
         if (seen.contains(param.name)) continue;
 
-        seen.put(param.name, {}) catch return "params";
-        unique_names.append(param.name) catch return "params";
+        try seen.put(param.name, {});
+        try unique_names.append(param.name);
     }
+}
+
+fn buildParamSummary(allocator: std.mem.Allocator, params: []const config.ParameterConfig, buffer: []u8) []const u8 {
+    var unique_names = std.ArrayList([]const u8).init(allocator);
+    defer unique_names.deinit();
+
+    appendUniqueParamNames(allocator, params, &unique_names) catch return "params";
 
     const unique_count = unique_names.items.len;
     if (unique_count == 0) return "";
@@ -833,6 +837,29 @@ fn buildParamSummary(allocator: std.mem.Allocator, params: []const config.Parame
     }
 
     return stream.getWritten();
+}
+
+fn buildParamTooltip(allocator: std.mem.Allocator, params: []const config.ParameterConfig) !?[]const u8 {
+    var unique_names = std.ArrayList([]const u8).init(allocator);
+    defer unique_names.deinit();
+
+    try appendUniqueParamNames(allocator, params, &unique_names);
+    if (unique_names.items.len <= 4) return null;
+
+    var tooltip = std.ArrayList(u8).init(allocator);
+    errdefer tooltip.deinit();
+    const writer = tooltip.writer();
+
+    try writer.print("{d} params", .{unique_names.items.len});
+    for (unique_names.items, 0..) |name, idx| {
+        if (idx == 0) {
+            try writer.print(": {s}", .{name});
+        } else {
+            try writer.print(", {s}", .{name});
+        }
+    }
+
+    return try tooltip.toOwnedSlice();
 }
 
 fn buildCommandPreview(command: []const u8, buffer: []u8) []const u8 {
@@ -935,13 +962,16 @@ fn buildCardMeta(allocator: std.mem.Allocator, s: *const script_mod.Script, scri
                 param_text = param_summary;
                 meta.has_params = true;
             }
+            meta.param_tooltip = try buildParamTooltip(allocator, cfg.parameters);
         }
     }
     var param_preview_buf: [120]u8 = undefined;
     const param_preview = truncateText(param_text, 88, &param_preview_buf);
     allocator.free(meta.param_line);
     meta.param_line = try allocator.dupe(u8, param_preview.text);
-    meta.param_tooltip = try duplicateOptionalText(allocator, if (param_preview.truncated) param_text else null);
+    if (meta.param_tooltip == null) {
+        meta.param_tooltip = try duplicateOptionalText(allocator, if (param_preview.truncated) param_text else null);
+    }
 
     return meta;
 }

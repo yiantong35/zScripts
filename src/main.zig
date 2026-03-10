@@ -78,6 +78,16 @@ pub fn main() !void {
     const font_size = 22.0; // 增加到 22px
     _ = zgui.io.addFontFromFile(font_path, font_size);
 
+    // 合并中文字体（STHeiti Medium），支持中文显示和输入
+    var cjk_config = zgui.FontConfig.init();
+    cjk_config.merge_mode = true;
+    _ = zgui.io.addFontFromFileWithConfig(
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        font_size,
+        cjk_config,
+        zgui.io.getGlyphRangesChineseSimplifiedCommon(),
+    );
+
     // 设置全局缩放
     const scale_factor: f32 = 1.5;
     zgui.getStyle().scaleAllSizes(scale_factor);
