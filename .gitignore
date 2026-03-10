@@ -1,0 +1,27 @@
+# Zig build artifacts
+zig-cache/
+.zig-cache/
+.zig-global-cache/
+zig-out/
+
+# ImGui config
+imgui.ini
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI assistant
+.claude/
+.codex/
+
+# Project docs (local only)
+CLAUDE.md
+PROJECT_STATUS.md
+TROUBLESHOOTING.md
