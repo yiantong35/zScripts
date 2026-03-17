@@ -130,12 +130,14 @@ pub const ExecutionResult = struct {
 pub const ScriptExecutor = struct {
     allocator: std.mem.Allocator,
     child_process: ?std.process.Child,
+    child_pgid: ?std.posix.pid_t,
     result: ExecutionResult,
 
     pub fn init(allocator: std.mem.Allocator) ScriptExecutor {
         return ScriptExecutor{
             .allocator = allocator,
             .child_process = null,
+            .child_pgid = null,
             .result = ExecutionResult.init(allocator),
         };
     }
@@ -277,6 +279,26 @@ pub const ScriptExecutor = struct {
 
         // 启动进程
         try child.spawn();
+
+        // 设置子进程为独立进程组（子进程成为组长）
+        const pid = child.id;
+        if (std.posix.setpgid(pid, pid)) |_| {
+            self.child_pgid = pid;
+        } else |_| {
+            self.child_pgid = null; // setpgid 失败，回退到单进程 kill
+        }
+
+        // 设置 stdout/stderr 为非阻塞模式
+        const O_NONBLOCK: i32 = 0x0004; // macOS O_NONBLOCK flag
+        if (child.stdout) |stdout| {
+            const flags = try std.posix.fcntl(stdout.handle, std.posix.F.GETFL, 0);
+            _ = try std.posix.fcntl(stdout.handle, std.posix.F.SETFL, flags | O_NONBLOCK);
+        }
+        if (child.stderr) |stderr| {
+            const flags = try std.posix.fcntl(stderr.handle, std.posix.F.GETFL, 0);
+            _ = try std.posix.fcntl(stderr.handle, std.posix.F.SETFL, flags | O_NONBLOCK);
+        }
+
         self.child_process = child;
 
         // 添加启动信息
@@ -314,14 +336,13 @@ pub const ScriptExecutor = struct {
                 }
             }
 
-            // 检查进程是否结束（非阻塞）
-            const term = child.wait() catch |err| {
-                if (err == error.WouldBlock) {
-                    // 进程还在运行
-                    return;
-                }
-                return err;
-            };
+            // 使用 waitpid 非阻塞检查进程状态
+            const result = std.posix.waitpid(child.id, std.posix.W.NOHANG);
+
+            if (result.pid == 0) {
+                // 进程还在运行
+                return;
+            }
 
             // 进程已结束，读取剩余输出
             if (child.stdout) |stdout| {
@@ -331,6 +352,8 @@ pub const ScriptExecutor = struct {
                     if (n == 0) break;
                     try self.result.appendOutput(buf[0..n]);
                 }
+                stdout.close();
+                child.stdout = null;
             }
             if (child.stderr) |stderr| {
                 var buf: [4096]u8 = undefined;
@@ -340,52 +363,65 @@ pub const ScriptExecutor = struct {
                     try self.result.appendOutput("[STDERR] ");
                     try self.result.appendOutput(buf[0..n]);
                 }
+                stderr.close();
+                child.stderr = null;
             }
 
-            // 更新状态
-            switch (term) {
-                .Exited => |code| {
-                    self.result.exit_code = @intCast(code);
-                    self.result.status = if (code == 0) .completed else .failed;
+            const status = std.posix.W.EXITSTATUS(result.status);
+            const signaled = std.posix.W.IFSIGNALED(result.status);
+            const stopped = std.posix.W.IFSTOPPED(result.status);
 
-                    var status_msg: [256]u8 = undefined;
-                    const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script finished with exit code {} ===\n", .{code});
-                    try self.result.appendOutput(msg);
-                },
-                .Signal => |sig| {
-                    self.result.exit_code = null;
-                    self.result.status = .stopped;
+            if (signaled) {
+                const sig = std.posix.W.TERMSIG(result.status);
+                self.result.exit_code = null;
+                self.result.status = .stopped;
 
-                    var status_msg: [256]u8 = undefined;
-                    const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script stopped by signal {} ===\n", .{sig});
-                    try self.result.appendOutput(msg);
-                },
-                .Stopped => |sig| {
-                    self.result.exit_code = null;
-                    self.result.status = .stopped;
+                var status_msg: [256]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script stopped by signal {} ===\n", .{sig});
+                try self.result.appendOutput(msg);
+            } else if (stopped) {
+                const sig = std.posix.W.STOPSIG(result.status);
+                self.result.exit_code = null;
+                self.result.status = .stopped;
 
-                    var status_msg: [256]u8 = undefined;
-                    const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script stopped by signal {} ===\n", .{sig});
-                    try self.result.appendOutput(msg);
-                },
-                .Unknown => |code| {
-                    self.result.exit_code = @intCast(code);
-                    self.result.status = .failed;
+                var status_msg: [256]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script stopped by signal {} ===\n", .{sig});
+                try self.result.appendOutput(msg);
+            } else {
+                self.result.exit_code = @intCast(status);
+                self.result.status = if (status == 0) .completed else .failed;
 
-                    var status_msg: [256]u8 = undefined;
-                    const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script terminated with unknown code {} ===\n", .{code});
-                    try self.result.appendOutput(msg);
-                },
+                var status_msg: [256]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&status_msg, "\n=== Script finished with exit code {} ===\n", .{status});
+                try self.result.appendOutput(msg);
             }
 
             self.child_process = null;
+            self.child_pgid = null;
         }
     }
 
     /// 停止执行
     pub fn stop(self: *ScriptExecutor) void {
         if (self.child_process) |*child| {
-            _ = child.kill() catch {};
+            // 杀死整个进程组（包括子进程）
+            if (self.child_pgid) |pgid| {
+                std.posix.kill(-pgid, std.posix.SIG.KILL) catch {};
+                self.child_pgid = null;
+            } else {
+                _ = child.kill() catch {};
+            }
+
+            // 关闭流
+            if (child.stdout) |stdout| {
+                stdout.close();
+                child.stdout = null;
+            }
+            if (child.stderr) |stderr| {
+                stderr.close();
+                child.stderr = null;
+            }
+
             _ = child.wait() catch {}; // 回收子进程，防止僵尸进程
             self.result.status = .stopped;
             self.child_process = null;
@@ -407,3 +443,7 @@ pub const ScriptExecutor = struct {
         return self.result.status == .running;
     }
 };
+
+test {
+    _ = @import("executor_test.zig");
+}

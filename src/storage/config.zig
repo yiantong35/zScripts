@@ -5,8 +5,10 @@ const CONFIG_DIR = ".zscripts";
 const CONFIG_FILE = "scripts.json";
 const PATHS_FILE = "paths.json";
 const HIDDEN_SCRIPTS_FILE = "hidden_scripts.json";
+const HISTORY_FILE = "history.json";
 const CONFIG_VERSION: u32 = 2;
 const CONFIG_WRITE_DEBOUNCE_MS: i64 = 300;
+const MAX_HISTORY_ENTRIES: usize = 100;
 
 /// 脚本参数配置
 pub const ParameterConfig = struct {
@@ -33,6 +35,16 @@ pub const HiddenScriptConfig = struct {
     path: []const u8,
 };
 
+/// 执行历史记录
+pub const HistoryEntry = struct {
+    script_path: []const u8,
+    script_name: []const u8,
+    command: []const u8,
+    exit_code: ?i32,
+    success: bool,
+    timestamp_ms: i64,
+};
+
 /// 配置管理器
 pub const ConfigManager = struct {
     allocator: std.mem.Allocator,
@@ -40,6 +52,7 @@ pub const ConfigManager = struct {
     config_file_path: []const u8,
     paths_file_path: []const u8,
     hidden_file_path: []const u8,
+    history_file_path: []const u8,
     script_configs: std.ArrayList(ScriptConfig),
     configs_loaded: bool,
     dirty: bool,
@@ -48,22 +61,28 @@ pub const ConfigManager = struct {
 
     pub fn init(allocator: std.mem.Allocator) !ConfigManager {
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
-
         const config_dir = try std.fs.path.join(allocator, &[_][]const u8{ home, CONFIG_DIR });
-        const config_file = try std.fs.path.join(allocator, &[_][]const u8{ home, CONFIG_DIR, CONFIG_FILE });
-        const paths_file = try std.fs.path.join(allocator, &[_][]const u8{ home, CONFIG_DIR, PATHS_FILE });
-        const hidden_file = try std.fs.path.join(allocator, &[_][]const u8{ home, CONFIG_DIR, HIDDEN_SCRIPTS_FILE });
+        defer allocator.free(config_dir);
+        return initWithDir(allocator, config_dir);
+    }
 
+    pub fn initWithDir(allocator: std.mem.Allocator, config_dir: []const u8) !ConfigManager {
         std.fs.makeDirAbsolute(config_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
+        const config_file = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, CONFIG_FILE });
+        const paths_file = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, PATHS_FILE });
+        const hidden_file = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, HIDDEN_SCRIPTS_FILE });
+        const history_file = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, HISTORY_FILE });
+
         return ConfigManager{
             .allocator = allocator,
-            .config_dir_path = config_dir,
+            .config_dir_path = try allocator.dupe(u8, config_dir),
             .config_file_path = config_file,
             .paths_file_path = paths_file,
             .hidden_file_path = hidden_file,
+            .history_file_path = history_file,
             .script_configs = std.ArrayList(ScriptConfig).init(allocator),
             .configs_loaded = false,
             .dirty = false,
@@ -79,6 +98,7 @@ pub const ConfigManager = struct {
         self.allocator.free(self.config_file_path);
         self.allocator.free(self.paths_file_path);
         self.allocator.free(self.hidden_file_path);
+        self.allocator.free(self.history_file_path);
     }
 
     fn cloneParameters(self: *ConfigManager, parameters: []const ParameterConfig) ![]ParameterConfig {
@@ -279,11 +299,30 @@ pub const ConfigManager = struct {
         return configs;
     }
 
+    /// 原子写入文件（临时文件 + fsync + rename）
+    fn atomicWriteFile(_: *ConfigManager, target_path: []const u8, content: []const u8) !void {
+        var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp", .{target_path});
+
+        var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        var file_closed = false;
+
+        errdefer {
+            if (!file_closed) tmp_file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+        }
+
+        try tmp_file.writeAll(content);
+        try tmp_file.sync();
+
+        tmp_file.close();
+        file_closed = true;
+
+        try std.fs.renameAbsolute(tmp_path, target_path);
+    }
+
     /// 写入配置到文件
     fn writeConfigs(self: *ConfigManager, configs: []const ScriptConfig) !void {
-        const file = try std.fs.createFileAbsolute(self.config_file_path, .{});
-        defer file.close();
-
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
 
@@ -318,7 +357,7 @@ pub const ConfigManager = struct {
         }
         try writer.writeAll("]\n");
 
-        try file.writeAll(buffer.items);
+        try self.atomicWriteFile(self.config_file_path, buffer.items);
     }
 
     /// 释放配置列表
@@ -338,9 +377,6 @@ pub const ConfigManager = struct {
 
     /// 保存路径列表
     pub fn savePaths(self: *ConfigManager, paths: []const PathConfig) !void {
-        const file = try std.fs.createFileAbsolute(self.paths_file_path, .{});
-        defer file.close();
-
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
 
@@ -359,7 +395,7 @@ pub const ConfigManager = struct {
         }
         try writer.writeAll("]\n");
 
-        try file.writeAll(buffer.items);
+        try self.atomicWriteFile(self.paths_file_path, buffer.items);
     }
 
     /// 加载路径列表
@@ -410,9 +446,6 @@ pub const ConfigManager = struct {
     }
 
     pub fn saveHiddenScripts(self: *ConfigManager, hidden: []const HiddenScriptConfig) !void {
-        const file = try std.fs.createFileAbsolute(self.hidden_file_path, .{});
-        defer file.close();
-
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
 
@@ -429,7 +462,7 @@ pub const ConfigManager = struct {
         }
         try writer.writeAll("]\n");
 
-        try file.writeAll(buffer.items);
+        try self.atomicWriteFile(self.hidden_file_path, buffer.items);
     }
 
     pub fn loadHiddenScripts(self: *ConfigManager) ![]HiddenScriptConfig {
@@ -481,4 +514,122 @@ pub const ConfigManager = struct {
         }
         self.allocator.free(hidden);
     }
+
+    pub fn saveHistory(self: *ConfigManager, entries: []const HistoryEntry) !void {
+        var buffer = std.ArrayList(u8).init(self.allocator);
+        defer buffer.deinit();
+
+        const writer = buffer.writer();
+        try writer.writeAll("[\n");
+        for (entries, 0..) |entry, i| {
+            try writer.writeAll("  {\n");
+            try writeJsonString(writer, "    \"script_path\": ", entry.script_path);
+            try writer.writeAll(",\n");
+            try writeJsonString(writer, "    \"script_name\": ", entry.script_name);
+            try writer.writeAll(",\n");
+            try writeJsonString(writer, "    \"command\": ", entry.command);
+            try writer.writeAll(",\n");
+            if (entry.exit_code) |code| {
+                try writer.print("    \"exit_code\": {d},\n", .{code});
+            } else {
+                try writer.writeAll("    \"exit_code\": null,\n");
+            }
+            try writer.print("    \"success\": {s},\n", .{if (entry.success) "true" else "false"});
+            try writer.print("    \"timestamp_ms\": {d}\n", .{entry.timestamp_ms});
+            if (i < entries.len - 1) {
+                try writer.writeAll("  },\n");
+            } else {
+                try writer.writeAll("  }\n");
+            }
+        }
+        try writer.writeAll("]\n");
+
+        try self.atomicWriteFile(self.history_file_path, buffer.items);
+    }
+
+    pub fn loadHistory(self: *ConfigManager) ![]HistoryEntry {
+        const file = std.fs.openFileAbsolute(self.history_file_path, .{}) catch |err| {
+            if (err == error.FileNotFound) return &[_]HistoryEntry{};
+            return err;
+        };
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
+        defer self.allocator.free(content);
+
+        if (content.len == 0) return &[_]HistoryEntry{};
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, content, .{}) catch {
+            return &[_]HistoryEntry{};
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .array) return &[_]HistoryEntry{};
+
+        var entries = std.ArrayList(HistoryEntry).init(self.allocator);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.script_path);
+                self.allocator.free(entry.script_name);
+                self.allocator.free(entry.command);
+            }
+            entries.deinit();
+        }
+
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const sp = item.object.get("script_path") orelse continue;
+            const sn = item.object.get("script_name") orelse continue;
+            const cmd = item.object.get("command") orelse continue;
+            const ts = item.object.get("timestamp_ms") orelse continue;
+            const suc = item.object.get("success") orelse continue;
+            if (sp != .string or sn != .string or cmd != .string or ts != .integer or suc != .bool) continue;
+
+            const exit_code: ?i32 = blk: {
+                const ec = item.object.get("exit_code") orelse break :blk null;
+                if (ec == .integer) break :blk @as(i32, @intCast(ec.integer));
+                break :blk null;
+            };
+
+            try entries.append(.{
+                .script_path = try self.allocator.dupe(u8, sp.string),
+                .script_name = try self.allocator.dupe(u8, sn.string),
+                .command = try self.allocator.dupe(u8, cmd.string),
+                .exit_code = exit_code,
+                .success = suc.bool,
+                .timestamp_ms = ts.integer,
+            });
+        }
+
+        return try entries.toOwnedSlice();
+    }
+
+    pub fn freeHistory(self: *ConfigManager, entries: []HistoryEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.script_path);
+            self.allocator.free(entry.script_name);
+            self.allocator.free(entry.command);
+        }
+        self.allocator.free(entries);
+    }
 };
+
+fn writeJsonString(writer: anytype, prefix: []const u8, value: []const u8) !void {
+    try writer.writeAll(prefix);
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+test {
+    _ = @import("config_test.zig");
+}

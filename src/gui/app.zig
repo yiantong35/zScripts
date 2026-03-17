@@ -1,12 +1,18 @@
 const std = @import("std");
 const zgui = @import("zgui");
-const zglfw = @import("zglfw");
 const scanner = @import("../core/scanner.zig");
-const script_mod = @import("../core/script.zig");
-const file_picker = @import("../core/file_picker.zig");
 const executor = @import("../core/executor.zig");
 const perf_monitor = @import("../core/perf_monitor.zig");
 const config = @import("../storage/config.zig");
+
+// 组件模块
+pub const home_page = @import("components/home_page.zig");
+pub const script_editor = @import("components/script_editor.zig");
+pub const execution_view = @import("components/execution_view.zig");
+pub const card = @import("components/card.zig");
+
+// 工具模块
+pub const text_utils = @import("utils/text_utils.zig");
 
 /// 添加的路径类型
 const PathEntry = struct {
@@ -27,7 +33,7 @@ const PathEntry = struct {
     }
 };
 
-const CardMeta = struct {
+pub const CardMeta = struct {
     title_line: []const u8,
     title_tooltip: ?[]const u8,
     desc_line: []const u8,
@@ -147,6 +153,7 @@ pub const AppState = struct {
     added_paths: std.ArrayList(PathEntry), // 已添加的路径列表
     hidden_scripts: std.StringHashMap(void), // 软删除脚本路径集合
     card_meta_cache: std.ArrayList(CardMeta), // 首页卡片预计算缓存
+    card_meta_dirty: bool, // 卡片缓存需要重建
     pending_tab_switch: ?usize, // 待切换的标签索引（用于强制切换）
     pending_shortcut_tab: ?usize, // Cmd+数字快捷键待切换的标签索引
     extra_frames_needed: u8, // 延迟 UI 操作还需要的活跃渲染帧数
@@ -160,6 +167,8 @@ pub const AppState = struct {
     input_grace_until_ms: i64,
     last_mouse_pos: [2]f32,
     last_mouse_pos_valid: bool,
+    search_query: [256:0]u8, // 搜索查询字符串
+    execution_history: std.ArrayList(config.HistoryEntry), // 执行历史记录
     perf: perf_monitor.PerfMonitor, // 性能观测
     config_manager: config.ConfigManager, // 配置管理器
 
@@ -175,6 +184,8 @@ pub const AppState = struct {
         @memset(&pending_remove_error, 0);
         var toast_message: [192:0]u8 = undefined;
         @memset(&toast_message, 0);
+        var search_query: [256:0]u8 = undefined;
+        @memset(&search_query, 0);
         var app_state = AppState{
             .tabs = tabs,
             .active_tab_index = 0,
@@ -185,6 +196,7 @@ pub const AppState = struct {
             .added_paths = std.ArrayList(PathEntry).init(allocator),
             .hidden_scripts = std.StringHashMap(void).init(allocator),
             .card_meta_cache = std.ArrayList(CardMeta).init(allocator),
+            .card_meta_dirty = true,
             .pending_tab_switch = null,
             .pending_shortcut_tab = null,
             .extra_frames_needed = 0,
@@ -198,6 +210,8 @@ pub const AppState = struct {
             .input_grace_until_ms = 0,
             .last_mouse_pos = .{ 0.0, 0.0 },
             .last_mouse_pos_valid = false,
+            .search_query = search_query,
+            .execution_history = std.ArrayList(config.HistoryEntry).init(allocator),
             .perf = try perf_monitor.PerfMonitor.init(allocator),
             .config_manager = try config.ConfigManager.init(allocator),
         };
@@ -225,7 +239,23 @@ pub const AppState = struct {
             try app_state.refreshScripts();
         }
         if (app_state.added_paths.items.len != saved_paths.len) {
-            saveAddedPaths(&app_state) catch {};
+            home_page.saveAddedPaths(&app_state) catch {};
+        }
+
+        // 加载执行历史
+        const saved_history = app_state.config_manager.loadHistory() catch &[_]config.HistoryEntry{};
+        for (saved_history) |entry| {
+            app_state.execution_history.append(.{
+                .script_path = allocator.dupe(u8, entry.script_path) catch continue,
+                .script_name = allocator.dupe(u8, entry.script_name) catch continue,
+                .command = allocator.dupe(u8, entry.command) catch continue,
+                .exit_code = entry.exit_code,
+                .success = entry.success,
+                .timestamp_ms = entry.timestamp_ms,
+            }) catch {};
+        }
+        if (saved_history.len > 0) {
+            app_state.config_manager.freeHistory(@constCast(saved_history));
         }
 
         return app_state;
@@ -249,6 +279,8 @@ pub const AppState = struct {
         self.clearPendingRemove();
         self.clearCardMetaCache();
         self.card_meta_cache.deinit();
+        self.freeExecutionHistory();
+        self.execution_history.deinit();
         self.config_manager.flushPendingWrites(true) catch {};
         self.perf.deinit();
         self.config_manager.deinit();
@@ -313,6 +345,44 @@ pub const AppState = struct {
         return self.input_grace_until_ms > std.time.milliTimestamp();
     }
 
+    pub fn getSearchQuery(self: *const AppState) []const u8 {
+        const len = std.mem.indexOfScalar(u8, &self.search_query, 0) orelse self.search_query.len;
+        return self.search_query[0..len];
+    }
+
+    pub fn addHistoryEntry(self: *AppState, script_path: []const u8, script_name: []const u8, command: []const u8, exit_code: ?i32, success: bool) void {
+        const entry = config.HistoryEntry{
+            .script_path = self.allocator.dupe(u8, script_path) catch return,
+            .script_name = self.allocator.dupe(u8, script_name) catch return,
+            .command = self.allocator.dupe(u8, command) catch return,
+            .exit_code = exit_code,
+            .success = success,
+            .timestamp_ms = std.time.milliTimestamp(),
+        };
+
+        self.execution_history.append(entry) catch return;
+
+        // 超过上限时移除最旧的记录
+        while (self.execution_history.items.len > 100) {
+            const old = self.execution_history.orderedRemove(0);
+            self.allocator.free(old.script_path);
+            self.allocator.free(old.script_name);
+            self.allocator.free(old.command);
+        }
+
+        // 持久化
+        self.config_manager.saveHistory(self.execution_history.items) catch {};
+    }
+
+    fn freeExecutionHistory(self: *AppState) void {
+        for (self.execution_history.items) |entry| {
+            self.allocator.free(entry.script_path);
+            self.allocator.free(entry.script_name);
+            self.allocator.free(entry.command);
+        }
+        self.execution_history.clearRetainingCapacity();
+    }
+
     fn hasActiveToast(self: *const AppState) bool {
         return self.toast_until_ms > std.time.milliTimestamp() and self.toast_message[0] != 0;
     }
@@ -328,11 +398,11 @@ pub const AppState = struct {
         self.requestExtraFrames(2);
     }
 
-    fn showSuccessToast(self: *AppState, message: []const u8) void {
+    pub fn showSuccessToast(self: *AppState, message: []const u8) void {
         self.showToast(.success, message);
     }
 
-    fn showErrorToast(self: *AppState, message: []const u8) void {
+    pub fn showErrorToast(self: *AppState, message: []const u8) void {
         self.showToast(.failure, message);
     }
 
@@ -363,14 +433,15 @@ pub const AppState = struct {
         try self.card_meta_cache.ensureTotalCapacity(scripts.len);
         for (scripts) |s| {
             const cfg = try self.config_manager.getScriptConfigView(s.path);
-            const meta = try buildCardMeta(self.allocator, &s, cfg);
+            const meta = try card.buildCardMeta(self.allocator, &s, cfg);
             self.card_meta_cache.appendAssumeCapacity(meta);
         }
+        self.card_meta_dirty = false;
     }
 
     pub fn rebuildCardMetaForScript(self: *AppState, script_path: []const u8) !void {
         const scripts = self.scanner.getScripts();
-        if (self.card_meta_cache.items.len != scripts.len) {
+        if (self.card_meta_dirty or self.card_meta_cache.items.len != scripts.len) {
             try self.rebuildCardMetaCache();
             return;
         }
@@ -379,7 +450,7 @@ pub const AppState = struct {
             if (!std.mem.eql(u8, s.path, script_path)) continue;
 
             const cfg = try self.config_manager.getScriptConfigView(s.path);
-            const new_meta = try buildCardMeta(self.allocator, &s, cfg);
+            const new_meta = try card.buildCardMeta(self.allocator, &s, cfg);
             self.card_meta_cache.items[idx].deinit();
             self.card_meta_cache.items[idx] = new_meta;
             return;
@@ -524,7 +595,7 @@ pub const AppState = struct {
 
         const hidden_added = try self.addHiddenScriptPath(normalized);
         if (path_removed) {
-            try saveAddedPaths(self);
+            try home_page.saveAddedPaths(self);
         }
         if (hidden_added) {
             try self.persistHiddenScripts();
@@ -661,9 +732,10 @@ pub const AppState = struct {
             }
         }
 
-        // 增加标签栏的内边距，让标签更大
-        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 20.0, 18.0 } });
-        defer zgui.popStyleVar(.{ .count = 1 });
+        // 微调标签内边距和内部间距，让关闭按钮更贴近右侧
+        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 16.0, 18.0 } });
+        zgui.pushStyleVar2f(.{ .idx = .item_inner_spacing, .v = [2]f32{ 8.0, 8.0 } });
+        defer zgui.popStyleVar(.{ .count = 2 });
 
         // 增加标签文字大小
         zgui.setWindowFontScale(1.2);
@@ -741,8 +813,8 @@ pub const AppState = struct {
 
         const active_tab = &self.tabs.items[self.active_tab_index];
         switch (active_tab.tab_type) {
-            .home => renderHomePage(self),
-            .script => renderScriptPage(self, active_tab),
+            .home => home_page.render(self),
+            .script => script_editor.render(self, active_tab),
         }
 
         renderRemoveScriptPopup(self);
@@ -754,245 +826,9 @@ pub const AppState = struct {
     }
 };
 
-const TruncateTextResult = struct {
-    text: []const u8,
-    truncated: bool,
-};
-
-fn truncateText(input: []const u8, max_chars: usize, buffer: []u8) TruncateTextResult {
-    if (input.len <= max_chars) {
-        return .{ .text = input, .truncated = false };
-    }
-
-    if (max_chars <= 3 or buffer.len < max_chars) {
-        const short_len = @min(@min(max_chars, input.len), buffer.len);
-        @memcpy(buffer[0..short_len], input[0..short_len]);
-        return .{ .text = buffer[0..short_len], .truncated = true };
-    }
-
-    const keep_len = max_chars - 3;
-    @memcpy(buffer[0..keep_len], input[0..keep_len]);
-    @memcpy(buffer[keep_len..max_chars], "...");
-    return .{ .text = buffer[0..max_chars], .truncated = true };
-}
-
-fn showItemTooltip(text: []const u8) void {
-    if (!zgui.isItemHovered(.{})) return;
-    if (zgui.beginTooltip()) {
-        zgui.textUnformatted(text);
-        zgui.endTooltip();
-    }
-}
-
-fn drawCenteredTextColored(text: []const u8, color: [4]f32) void {
-    const avail_w = zgui.getContentRegionAvail()[0];
-    const text_size = zgui.calcTextSize(text, .{});
-    if (avail_w > text_size[0]) {
-        zgui.setCursorPosX(zgui.getCursorPosX() + (avail_w - text_size[0]) * 0.5);
-    }
-    zgui.textColored(color, "{s}", .{text});
-}
-
-fn appendUniqueParamNames(allocator: std.mem.Allocator, params: []const config.ParameterConfig, unique_names: *std.ArrayList([]const u8)) !void {
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
-    for (params) |param| {
-        if (param.name.len == 0) continue;
-        if (seen.contains(param.name)) continue;
-
-        try seen.put(param.name, {});
-        try unique_names.append(param.name);
-    }
-}
-
-fn buildParamSummary(allocator: std.mem.Allocator, params: []const config.ParameterConfig, buffer: []u8) []const u8 {
-    var unique_names = std.ArrayList([]const u8).init(allocator);
-    defer unique_names.deinit();
-
-    appendUniqueParamNames(allocator, params, &unique_names) catch return "params";
-
-    const unique_count = unique_names.items.len;
-    if (unique_count == 0) return "";
-
-    var stream = std.io.fixedBufferStream(buffer);
-    const writer = stream.writer();
-
-    writer.print("{d} params", .{unique_count}) catch return "params";
-
-    var shown: usize = 0;
-    for (unique_names.items) |name| {
-        if (shown >= 4) break;
-
-        if (shown == 0) {
-            writer.print(": {s}", .{name}) catch break;
-        } else {
-            writer.print(", {s}", .{name}) catch break;
-        }
-        shown += 1;
-    }
-
-    if (unique_count > shown) {
-        writer.print(", +{d}", .{unique_count - shown}) catch {};
-    }
-
-    return stream.getWritten();
-}
-
-fn buildParamTooltip(allocator: std.mem.Allocator, params: []const config.ParameterConfig) !?[]const u8 {
-    var unique_names = std.ArrayList([]const u8).init(allocator);
-    defer unique_names.deinit();
-
-    try appendUniqueParamNames(allocator, params, &unique_names);
-    if (unique_names.items.len <= 4) return null;
-
-    var tooltip = std.ArrayList(u8).init(allocator);
-    errdefer tooltip.deinit();
-    const writer = tooltip.writer();
-
-    try writer.print("{d} params", .{unique_names.items.len});
-    for (unique_names.items, 0..) |name, idx| {
-        if (idx == 0) {
-            try writer.print(": {s}", .{name});
-        } else {
-            try writer.print(", {s}", .{name});
-        }
-    }
-
-    return try tooltip.toOwnedSlice();
-}
-
-fn buildCommandPreview(command: []const u8, buffer: []u8) []const u8 {
-    const trimmed = std.mem.trim(u8, command, " ");
-    if (trimmed.len == 0) return command;
-
-    var stream = std.io.fixedBufferStream(buffer);
-    const writer = stream.writer();
-    var changed = false;
-    var first = true;
-
-    var iter = std.mem.tokenizeScalar(u8, trimmed, ' ');
-    while (iter.next()) |token| {
-        if (!first) {
-            writer.writeByte(' ') catch return if (changed) stream.getWritten() else command;
-        }
-        first = false;
-
-        if (std.mem.indexOfScalar(u8, token, '/')) |_| {
-            const basename = std.fs.path.basename(token);
-            if (basename.len < token.len) {
-                writer.print(".../{s}", .{basename}) catch return if (changed) stream.getWritten() else command;
-                changed = true;
-                continue;
-            }
-        }
-
-        writer.writeAll(token) catch return if (changed) stream.getWritten() else command;
-    }
-
-    return if (changed) stream.getWritten() else command;
-}
-
-fn duplicateOptionalText(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
-    if (text) |value| {
-        return try allocator.dupe(u8, value);
-    }
-    return null;
-}
-
-fn buildCardMeta(allocator: std.mem.Allocator, s: *const script_mod.Script, script_config: ?*const config.ScriptConfig) !CardMeta {
-    var meta = CardMeta{
-        .title_line = try allocator.dupe(u8, ""),
-        .title_tooltip = null,
-        .desc_line = try allocator.dupe(u8, ""),
-        .desc_tooltip = null,
-        .has_desc = false,
-        .command_line = try allocator.dupe(u8, ""),
-        .command_tooltip = null,
-        .param_line = try allocator.dupe(u8, ""),
-        .param_tooltip = null,
-        .has_params = false,
-        .allocator = allocator,
-    };
-    errdefer meta.deinit();
-
-    var title_preview_buf: [96]u8 = undefined;
-    const title_preview = truncateText(s.name, 32, &title_preview_buf);
-    allocator.free(meta.title_line);
-    meta.title_line = try allocator.dupe(u8, title_preview.text);
-    meta.title_tooltip = try duplicateOptionalText(allocator, if (title_preview.truncated) s.name else null);
-
-    var desc_text: []const u8 = "No description";
-    if (script_config) |cfg| {
-        if (cfg.description.len > 0) {
-            desc_text = cfg.description;
-            meta.has_desc = true;
-        }
-    }
-    var desc_preview_buf: [120]u8 = undefined;
-    const desc_preview = truncateText(desc_text, 52, &desc_preview_buf);
-    allocator.free(meta.desc_line);
-    meta.desc_line = try allocator.dupe(u8, desc_preview.text);
-    meta.desc_tooltip = try duplicateOptionalText(allocator, if (desc_preview.truncated) desc_text else null);
-
-    const cmd = if (script_config) |cfg| cfg.command else "";
-    if (cmd.len > 0) {
-        var cmd_source_buf: [220]u8 = undefined;
-        const cmd_source = buildCommandPreview(cmd, &cmd_source_buf);
-        var cmd_preview_buf: [180]u8 = undefined;
-        const cmd_preview = truncateText(cmd_source, 46, &cmd_preview_buf);
-        var cmd_display_buf: [200]u8 = undefined;
-        const cmd_display = std.fmt.bufPrint(&cmd_display_buf, "$ {s}", .{cmd_preview.text}) catch cmd_preview.text;
-        allocator.free(meta.command_line);
-        meta.command_line = try allocator.dupe(u8, cmd_display);
-        const has_cmd_tooltip = cmd_preview.truncated or !std.mem.eql(u8, cmd_source, cmd);
-        meta.command_tooltip = try duplicateOptionalText(allocator, if (has_cmd_tooltip) cmd else null);
-    } else {
-        allocator.free(meta.command_line);
-        meta.command_line = try allocator.dupe(u8, "No command");
-        meta.command_tooltip = null;
-    }
-
-    var param_text: []const u8 = "No params";
-    if (script_config) |cfg| {
-        if (cfg.parameters.len > 0) {
-            var param_summary_buf: [220]u8 = undefined;
-            const param_summary = buildParamSummary(allocator, cfg.parameters, &param_summary_buf);
-            if (param_summary.len > 0) {
-                param_text = param_summary;
-                meta.has_params = true;
-            }
-            meta.param_tooltip = try buildParamTooltip(allocator, cfg.parameters);
-        }
-    }
-    var param_preview_buf: [120]u8 = undefined;
-    const param_preview = truncateText(param_text, 88, &param_preview_buf);
-    allocator.free(meta.param_line);
-    meta.param_line = try allocator.dupe(u8, param_preview.text);
-    if (meta.param_tooltip == null) {
-        meta.param_tooltip = try duplicateOptionalText(allocator, if (param_preview.truncated) param_text else null);
-    }
-
-    return meta;
-}
-
-fn tailOutputView(text: []const u8, max_lines: usize, max_bytes: usize) []const u8 {
-    if (text.len == 0) return text;
-
-    const min_start = if (text.len > max_bytes) text.len - max_bytes else 0;
-    var lines_seen: usize = 0;
-    var i = text.len;
-    while (i > min_start) {
-        i -= 1;
-        if (text[i] != '\n') continue;
-        lines_seen += 1;
-        if (lines_seen > max_lines) {
-            return text[i + 1 ..];
-        }
-    }
-
-    return text[min_start..];
-}
+// 公共 re-exports（供 execution_view 等组件使用）
+pub const tailOutputView = text_utils.tailOutputView;
+pub const copyTextToClipboard = text_utils.copyTextToClipboard;
 
 fn renderRemoveScriptPopup(app_state: *AppState) void {
     if (app_state.pending_remove_path != null) {
@@ -1144,872 +980,4 @@ fn renderPerfWindow(app_state: *AppState) void {
     }
     zgui.end();
     app_state.perf.show_window = open;
-}
-
-/// 渲染首页
-fn renderHomePage(app_state: *AppState) void {
-    // 覆盖标签栏底部的线条
-    const cursor_y = zgui.getCursorScreenPos()[1];
-    const viewport_size = zgui.getMainViewport().getSize();
-    const cover_draw_list = zgui.getWindowDrawList();
-    const bg_color = zgui.colorConvertFloat4ToU32([4]f32{ 0.0, 0.0, 0.0, 1.0 });
-
-    // 在内容区域顶部绘制覆盖矩形
-    cover_draw_list.addRectFilled(.{
-        .pmin = [2]f32{ 0, cursor_y - 5 },
-        .pmax = [2]f32{ viewport_size[0], cursor_y + 5 },
-        .col = bg_color,
-    });
-
-    // 工具栏 - 增加按钮高度和文字大小
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 20.0, 15.0 } });
-
-    // 增加按钮文字大小
-    zgui.setWindowFontScale(1.2);
-
-    const button_width: f32 = 180;
-    const button_height: f32 = 60;
-
-    // 主按钮
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.188, 0.176, 0.165, 1.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = [4]f32{ 0.227, 0.212, 0.196, 1.0 } });
-
-    const add_scripts_button_pos = zgui.getCursorScreenPos();
-    const button_clicked = zgui.button("Add Scripts", .{ .w = button_width, .h = button_height });
-
-    zgui.popStyleColor(.{ .count = 3 });
-
-    if (button_clicked) {
-        zgui.openPopup("Select Type", .{});
-        app_state.requestExtraFrames(2);
-    }
-
-    // 选择类型弹窗 - 固定在按钮下方
-    zgui.setNextWindowPos(.{
-        .x = add_scripts_button_pos[0],
-        .y = add_scripts_button_pos[1] + button_height + 8.0,
-        .cond = .appearing,
-    });
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 15.0, 12.0 } });
-    if (zgui.beginPopup("Select Type", .{})) {
-        defer zgui.endPopup();
-
-        zgui.setWindowFontScale(1.15);
-        defer zgui.setWindowFontScale(1.0);
-
-        if (zgui.selectable("Select Folders", .{ .h = 40 })) {
-            importPathsFromPicker(app_state, .directories, true);
-        }
-
-        if (zgui.selectable("Select Files", .{ .h = 40 })) {
-            importPathsFromPicker(app_state, .files, false);
-        }
-    }
-    zgui.popStyleVar(.{ .count = 1 });
-
-    zgui.sameLine(.{});
-    // 次按钮：中性灰色，避免和主按钮抢层级
-    zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.188, 0.176, 0.165, 1.0 } });
-    zgui.pushStyleColor4f(.{ .idx = .button_active, .c = [4]f32{ 0.227, 0.212, 0.196, 1.0 } });
-    if (zgui.button("Refresh", .{ .w = button_width, .h = button_height })) {
-        const refreshed = blk: {
-            app_state.refreshScripts() catch |err| {
-                var msg_buf: [160]u8 = undefined;
-                const msg = std.fmt.bufPrint(&msg_buf, "Refresh failed: {s}", .{@errorName(err)}) catch "Refresh failed";
-                app_state.showErrorToast(msg);
-                break :blk false;
-            };
-            break :blk true;
-        };
-        if (refreshed) {
-            app_state.current_page = 0;
-            var toast_buf: [96]u8 = undefined;
-            const toast_msg = std.fmt.bufPrint(&toast_buf, "Refreshed {d} scripts", .{app_state.scanner.getScripts().len}) catch "Refresh complete";
-            app_state.showSuccessToast(toast_msg);
-        }
-    }
-    zgui.popStyleColor(.{ .count = 3 });
-
-    // 工具栏样式仅作用于顶部控件，避免影响卡片里的小按钮布局
-    zgui.popStyleVar(.{ .count = 1 });
-    zgui.setWindowFontScale(1.0);
-
-    zgui.spacing();
-    zgui.spacing();
-
-    // 脚本卡片网格标题 + Perf 复选框同行
-    const scripts = app_state.scanner.getScripts();
-    const total_scripts = scripts.len;
-    if (app_state.card_meta_cache.items.len != total_scripts) {
-        app_state.rebuildCardMetaCache() catch {};
-    }
-    const has_card_meta = app_state.card_meta_cache.items.len == total_scripts;
-
-    zgui.setWindowFontScale(1.3);
-    var title_buf: [64]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "Scripts ({d})", .{total_scripts}) catch "Scripts";
-    zgui.text("{s}", .{title});
-    zgui.setWindowFontScale(1.0);
-
-    // Perf 复选框放在 Scripts 标题同行靠右
-    zgui.sameLine(.{});
-    const label_perf_window_w = zgui.calcTextSize("Perf Window", .{})[0];
-    const label_perf_log_w = zgui.calcTextSize("Perf Log", .{})[0];
-    const checkbox_w: f32 = 20.0;
-    const perf_gap: f32 = 8.0;
-    const perf_group_width = checkbox_w + label_perf_window_w + perf_gap + checkbox_w + label_perf_log_w + 22.0;
-    const perf_right_padding: f32 = 10.0;
-    const perf_cursor_x = zgui.getCursorPosX();
-    const perf_remain_w = zgui.getContentRegionAvail()[0];
-    if (perf_remain_w > perf_group_width + perf_right_padding) {
-        zgui.setCursorPosX(perf_cursor_x + perf_remain_w - perf_group_width - perf_right_padding);
-    }
-    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 3.0, 3.0 } });
-    _ = zgui.checkbox("Perf Window", .{ .v = &app_state.perf.show_window });
-    zgui.sameLine(.{ .spacing = perf_gap });
-    _ = zgui.checkbox("Perf Log", .{ .v = &app_state.perf.enable_log });
-    zgui.popStyleVar(.{ .count = 1 });
-
-    zgui.spacing();
-    zgui.spacing();
-
-    // 计算总页数，单页时隐藏分页栏
-    const total_pages = if (total_scripts == 0) 1 else (total_scripts + app_state.scripts_per_page - 1) / app_state.scripts_per_page;
-    if (app_state.current_page >= total_pages) {
-        app_state.current_page = total_pages - 1;
-    }
-    const show_pagination = total_pages > 1;
-
-    // 动态计算卡片布局 - 根据可用空间自适应
-    const remaining_avail = zgui.getContentRegionAvail();
-    const spacing: f32 = 20;
-    const cols: usize = 4; // 4 列
-    const rows: usize = 3; // 3 行
-
-    // 计算卡片宽度和高度，填满整个可用空间
-    const card_width = (remaining_avail[0] - spacing * @as(f32, @floatFromInt(cols + 1))) / @as(f32, @floatFromInt(cols));
-    const pagination_height: f32 = if (show_pagination) 80 else 0;
-    const card_height = (remaining_avail[1] - pagination_height - spacing * @as(f32, @floatFromInt(rows + 1))) / @as(f32, @floatFromInt(rows));
-
-    // 计算分页
-    const start_idx = app_state.current_page * app_state.scripts_per_page;
-    const end_idx = @min(start_idx + app_state.scripts_per_page, total_scripts);
-    const visible_count = end_idx - start_idx;
-
-    if (visible_count == 0) {
-        zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = [4]f32{ 0.090, 0.086, 0.082, 1.0 } });
-        zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 8.0 });
-        defer zgui.popStyleColor(.{ .count = 1 });
-        defer zgui.popStyleVar(.{ .count = 1 });
-
-        if (zgui.beginChild("EmptyState", .{ .w = -1, .h = 220 })) {
-            zgui.dummy(.{ .w = 0, .h = 45 });
-            zgui.setWindowFontScale(1.2);
-            zgui.textColored(.{ 0.925, 0.914, 0.890, 1.0 }, "No scripts yet", .{});
-            zgui.setWindowFontScale(1.0);
-            zgui.spacing();
-            zgui.textColored(.{ 0.655, 0.624, 0.584, 1.0 }, "Click Add Scripts to import your first script.", .{});
-        }
-        zgui.endChild();
-    } else {
-        // 脚本卡片 - 仅显示当前页真实脚本，不渲染空占位卡
-        for (0..visible_count) |i| {
-            const col = i % cols;
-
-            if (col > 0) {
-                zgui.sameLine(.{ .spacing = spacing });
-            }
-
-            const script_idx = start_idx + i;
-            const s = scripts[script_idx];
-            const card_meta = if (has_card_meta) &app_state.card_meta_cache.items[script_idx] else null;
-
-            // 绘制卡片阴影
-            const draw_list = zgui.getWindowDrawList();
-            const cursor_pos = zgui.getCursorScreenPos();
-            const shadow_offset: f32 = 4.0;
-            const shadow_color = zgui.colorConvertFloat4ToU32([4]f32{ 0.0, 0.0, 0.0, 0.40 });
-
-            draw_list.addRectFilled(.{
-                .pmin = [2]f32{ cursor_pos[0] + shadow_offset, cursor_pos[1] + shadow_offset },
-                .pmax = [2]f32{ cursor_pos[0] + card_width + shadow_offset, cursor_pos[1] + card_height + shadow_offset },
-                .col = shadow_color,
-                .rounding = 8.0,
-            });
-
-            // 卡片内容区域 - 检测悬停状态设置不同背景色
-            var card_id_buf: [32:0]u8 = undefined;
-            const card_id = std.fmt.bufPrintZ(&card_id_buf, "##card_{d}", .{script_idx}) catch "##card";
-
-            // 先绘制卡片背景（悬停变色在下面处理）
-            zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = [4]f32{ 0.090, 0.086, 0.082, 1.0 } });
-            zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 8.0 });
-            defer zgui.popStyleColor(.{ .count = 1 });
-            defer zgui.popStyleVar(.{ .count = 1 });
-
-            if (zgui.beginChild(card_id, .{ .w = card_width, .h = card_height })) {
-                const win_pos = zgui.getWindowPos();
-                const win_size = zgui.getWindowSize();
-                const content_start = zgui.getCursorPos();
-                const hit_size = zgui.getContentRegionAvail();
-
-                var hit_id_buf: [40:0]u8 = undefined;
-                const hit_id = std.fmt.bufPrintZ(&hit_id_buf, "##card_hit_{d}", .{script_idx}) catch "##card_hit";
-                _ = zgui.invisibleButton(hit_id, .{ .w = hit_size[0], .h = hit_size[1] });
-                const is_hovered = zgui.isItemHovered(.rect_only);
-                const right_clicked = zgui.isItemClicked(.right);
-                const left_double_clicked = is_hovered and zgui.isMouseDoubleClicked(.left);
-                zgui.setCursorPos(content_start);
-
-                // 悬停时绘制高亮背景
-                if (is_hovered) {
-                    const card_draw = zgui.getWindowDrawList();
-                    const hover_color = zgui.colorConvertFloat4ToU32([4]f32{ 0.137, 0.129, 0.118, 1.0 });
-                    card_draw.addRectFilled(.{
-                        .pmin = win_pos,
-                        .pmax = [2]f32{ win_pos[0] + win_size[0], win_pos[1] + win_size[1] },
-                        .col = hover_color,
-                        .rounding = 8.0,
-                    });
-                }
-
-                // 右键菜单：基于整卡 hit-area，触摸板双指右键触发更稳定
-                var popup_id_buf: [56:0]u8 = undefined;
-                const popup_id = std.fmt.bufPrintZ(&popup_id_buf, "CardContext##ctx_{d}", .{script_idx}) catch "CardContext";
-                if (right_clicked) {
-                    const popup_x = win_pos[0] + @max(10.0, win_size[0] - 236.0);
-                    const popup_y = win_pos[1] + @max(10.0, win_size[1] - 56.0);
-                    zgui.setNextWindowPos(.{ .x = popup_x, .y = popup_y, .cond = .always });
-                    zgui.openPopup(popup_id, .{});
-                    app_state.requestExtraFrames(2);
-                }
-                if (zgui.beginPopup(popup_id, .{})) {
-                    defer zgui.endPopup();
-                    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 14.0, 10.0 } });
-                    zgui.setWindowFontScale(1.18);
-                    defer zgui.popStyleVar(.{ .count = 1 });
-                    defer zgui.setWindowFontScale(1.0);
-
-                    if (zgui.selectable("Remove from zScripts", .{ .h = 40 })) {
-                        app_state.requestRemoveScript(s.path, s.name) catch {};
-                    }
-                }
-
-                // 卡片信息区：整体居中显示
-                const content_top = @max(18.0, card_height * 0.16);
-                const content_bottom_margin = @max(14.0, card_height * 0.08);
-                const row_step = @max(26.0, (card_height - content_top - content_bottom_margin) / 3.0);
-
-                // === 脚本名称（单行，固定第1行） ===
-                zgui.setCursorPosY(content_top);
-                zgui.setWindowFontScale(1.38);
-                drawCenteredTextColored(if (card_meta) |meta| meta.title_line else s.name, [4]f32{ 0.925, 0.914, 0.890, 1.0 });
-                if (card_meta) |meta| {
-                    if (meta.title_tooltip) |tooltip_text| {
-                        showItemTooltip(tooltip_text);
-                    }
-                }
-                zgui.setWindowFontScale(1.0);
-
-                // === 描述（单行，固定第2行） ===
-                zgui.setCursorPosY(content_top + row_step);
-                zgui.setWindowFontScale(1.16);
-                if (card_meta) |meta| {
-                    drawCenteredTextColored(meta.desc_line, if (meta.has_desc) [4]f32{ 0.655, 0.624, 0.584, 1.0 } else [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                    if (meta.desc_tooltip) |tooltip_text| {
-                        showItemTooltip(tooltip_text);
-                    }
-                } else {
-                    drawCenteredTextColored("No description", [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                }
-                zgui.setWindowFontScale(1.0);
-
-                // === 执行命令（单行，固定第3行） ===
-                zgui.setCursorPosY(content_top + row_step * 2.0);
-                zgui.setWindowFontScale(1.08);
-                if (card_meta) |meta| {
-                    drawCenteredTextColored(meta.command_line, [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                    if (meta.command_tooltip) |tooltip_text| {
-                        showItemTooltip(tooltip_text);
-                    }
-                } else {
-                    drawCenteredTextColored("$", [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                }
-                zgui.setWindowFontScale(1.0);
-
-                // === 参数摘要（单行，固定第4行） ===
-                zgui.setCursorPosY(content_top + row_step * 3.0);
-                zgui.setWindowFontScale(1.12);
-                if (card_meta) |meta| {
-                    drawCenteredTextColored(meta.param_line, if (meta.has_params) [4]f32{ 0.541, 0.659, 0.745, 1.0 } else [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                    if (meta.param_tooltip) |tooltip_text| {
-                        showItemTooltip(tooltip_text);
-                    }
-                } else {
-                    drawCenteredTextColored("No params", [4]f32{ 0.545, 0.522, 0.490, 1.0 });
-                }
-                zgui.setWindowFontScale(1.0);
-
-                if (left_double_clicked) {
-                    app_state.openScriptTab(s.path, s.name) catch {};
-                }
-            }
-            zgui.endChild();
-        }
-    }
-
-    if (show_pagination) {
-        zgui.spacing();
-        zgui.spacing();
-
-        // 分页控件 - 水平和垂直居中显示
-        const pagination_button_height: f32 = 60;
-        const text_width: f32 = 250; // 预估文字宽度
-        const pagination_spacing: f32 = 20;
-        const total_pagination_width = button_width * 2 + text_width + pagination_spacing * 2;
-        const current_page_display = app_state.current_page + 1; // 显示从1开始
-
-        // 获取剩余可用空间
-        const remaining_space = zgui.getContentRegionAvail();
-
-        // 垂直居中 - 添加垂直偏移
-        const vertical_offset = (remaining_space[1] - pagination_button_height) / 2.0;
-        if (vertical_offset > 0) {
-            zgui.dummy(.{ .w = 0, .h = vertical_offset });
-        }
-
-        // 水平居中
-        const pagination_offset = (remaining_space[0] - total_pagination_width) / 2.0;
-        if (pagination_offset > 0) {
-            zgui.setCursorPosX(zgui.getCursorPosX() + pagination_offset);
-        }
-
-        // 按钮样式 - 使用全局强调色，增加文字大小
-        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 20.0, 15.0 } });
-        zgui.setWindowFontScale(1.2);
-        defer zgui.popStyleVar(.{ .count = 1 });
-        defer zgui.setWindowFontScale(1.0);
-
-        // 上一页按钮
-        const can_prev = app_state.current_page > 0;
-        if (!can_prev) {
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.10, 0.10, 0.10, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.10, 0.10, 0.10, 1.0 } });
-            defer zgui.popStyleColor(.{ .count = 2 });
-        }
-        if (zgui.button("Previous", .{ .w = button_width, .h = pagination_button_height }) and can_prev) {
-            app_state.current_page -= 1;
-        }
-        zgui.sameLine(.{ .spacing = pagination_spacing });
-
-        // 页码显示
-        zgui.setWindowFontScale(1.4);
-        var page_buf: [32]u8 = undefined;
-        const page_text = std.fmt.bufPrint(&page_buf, "Page {d} / {d}", .{ current_page_display, total_pages }) catch "Page 1";
-        zgui.text("{s}", .{page_text});
-        zgui.setWindowFontScale(1.2); // 恢复到按钮字体大小
-
-        zgui.sameLine(.{ .spacing = pagination_spacing });
-
-        // 下一页按钮
-        const can_next = app_state.current_page + 1 < total_pages;
-        if (!can_next) {
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.10, 0.10, 0.10, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.10, 0.10, 0.10, 1.0 } });
-            defer zgui.popStyleColor(.{ .count = 2 });
-        }
-        if (zgui.button("Next", .{ .w = button_width, .h = pagination_button_height }) and can_next) {
-            app_state.current_page += 1;
-        }
-    }
-}
-
-fn copyTextToClipboard(allocator: std.mem.Allocator, text: []const u8) bool {
-    if (text.len == 0) return false;
-    const window = zglfw.getCurrentContext() orelse return false;
-    const text_z = std.fmt.allocPrintZ(allocator, "{s}", .{text}) catch return false;
-    defer allocator.free(text_z);
-    zglfw.setClipboardString(window, text_z);
-    return true;
-}
-
-fn importPathsFromPicker(app_state: *AppState, picker_type: file_picker.PickerType, is_directory: bool) void {
-    const picker_result_opt = file_picker.showFilePicker(app_state.allocator, picker_type) catch |err| {
-        var msg_buf: [160]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "Import failed: {s}", .{@errorName(err)}) catch "Import failed";
-        app_state.showErrorToast(msg);
-        return;
-    };
-    if (picker_result_opt) |result| {
-        var picker_result = result;
-        defer picker_result.deinit();
-
-        const scripts_before = app_state.scanner.getScripts().len;
-        var added_paths_count: usize = 0;
-        for (picker_result.paths) |path| {
-            const added = app_state.addPathIfMissing(path, is_directory) catch |err| {
-                var msg_buf: [160]u8 = undefined;
-                const msg = std.fmt.bufPrint(&msg_buf, "Import failed: {s}", .{@errorName(err)}) catch "Import failed";
-                app_state.showErrorToast(msg);
-                return;
-            };
-            if (added) added_paths_count += 1;
-        }
-
-        if (added_paths_count == 0) return;
-
-        app_state.refreshScripts() catch |err| {
-            var msg_buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Refresh failed: {s}", .{@errorName(err)}) catch "Refresh failed";
-            app_state.showErrorToast(msg);
-            return;
-        };
-        app_state.current_page = 0;
-        saveAddedPaths(app_state) catch |err| {
-            var msg_buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Save paths failed: {s}", .{@errorName(err)}) catch "Save paths failed";
-            app_state.showErrorToast(msg);
-            return;
-        };
-
-        const scripts_after = app_state.scanner.getScripts().len;
-        const imported_scripts = if (scripts_after > scripts_before) scripts_after - scripts_before else 0;
-        var success_buf: [96]u8 = undefined;
-        const success_msg = if (imported_scripts > 0)
-            std.fmt.bufPrint(&success_buf, "Imported {d} scripts", .{imported_scripts}) catch "Import complete"
-        else
-            std.fmt.bufPrint(&success_buf, "Imported {d} paths", .{added_paths_count}) catch "Import complete";
-        app_state.showSuccessToast(success_msg);
-    }
-}
-
-fn executeScriptFromTab(app_state: *AppState, tab: *Tab) bool {
-    if (tab.script_path) |path| {
-        saveTabConfig(app_state, tab) catch |err| {
-            var msg_buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
-            app_state.showErrorToast(msg);
-            return false;
-        };
-
-        const script_name = std.fs.path.basename(path);
-        const cmd_len = std.mem.indexOfScalar(u8, &tab.command, 0) orelse tab.command.len;
-        const command = tab.command[0..cmd_len];
-
-        var script = script_mod.Script.init(tab.allocator, path, script_name, command) catch |err| {
-            var msg_buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Prepare failed: {s}", .{@errorName(err)}) catch "Prepare failed";
-            app_state.showErrorToast(msg);
-            return false;
-        };
-        defer script.deinit();
-
-        for (tab.parameters.items) |param| {
-            const name_len = std.mem.indexOfScalar(u8, &param.name, 0) orelse param.name.len;
-            const value_len = std.mem.indexOfScalar(u8, &param.value, 0) orelse param.value.len;
-            if (name_len > 0) {
-                script.addArg(param.name[0..name_len], param.value[0..value_len]) catch {};
-            }
-        }
-
-        if (tab.script_executor) |*exec| {
-            var mut_exec = exec.*;
-            const started = blk: {
-                mut_exec.execute(&script) catch |err| {
-                    var msg_buf: [256]u8 = undefined;
-                    const msg = switch (err) {
-                        error.MissingCommand => "Python script requires command, e.g. uv run or python3",
-                        error.UnterminatedSingleQuote,
-                        error.UnterminatedDoubleQuote,
-                        error.TrailingEscape,
-                        => std.fmt.bufPrint(&msg_buf, "Invalid command syntax: {s}", .{@errorName(err)}) catch "Invalid command syntax",
-                        else => std.fmt.bufPrint(&msg_buf, "Execution error: {s}", .{@errorName(err)}) catch "Execution error",
-                    };
-                    mut_exec.setStartError(msg);
-                    break :blk false;
-                };
-                break :blk true;
-            };
-            tab.script_executor = mut_exec;
-            return started;
-        }
-    }
-    return false;
-}
-
-/// 渲染脚本标签页
-fn renderScriptPage(app_state: *AppState, tab: *Tab) void {
-    const detail_font_scale: f32 = 1.22;
-    const cursor_y = zgui.getCursorScreenPos()[1];
-    const viewport_size = zgui.getMainViewport().getSize();
-    const cover_draw_list = zgui.getWindowDrawList();
-    const bg_color = zgui.colorConvertFloat4ToU32([4]f32{ 0.14, 0.14, 0.16, 1.0 });
-
-    cover_draw_list.addRectFilled(.{
-        .pmin = [2]f32{ 0, cursor_y - 5 },
-        .pmax = [2]f32{ viewport_size[0], cursor_y + 5 },
-        .col = bg_color,
-    });
-
-    if (tab.script_executor) |*exec| {
-        var mut_exec = exec.*;
-        if (mut_exec.isRunning()) {
-            mut_exec.poll() catch |err| {
-                std.debug.print("Poll error: {}\n", .{err});
-            };
-            tab.script_executor = mut_exec;
-        }
-    }
-
-    const avail = zgui.getContentRegionAvail();
-    const control_ratio: f32 = 0.42;
-    const min_control_h: f32 = 250.0;
-    const min_output_h: f32 = 220.0;
-    var control_height = avail[1] * control_ratio;
-    if (avail[1] >= min_control_h + min_output_h) {
-        control_height = @max(min_control_h, @min(control_height, avail[1] - min_output_h));
-    } else {
-        control_height = avail[1] * 0.5;
-    }
-    const output_height = @max(0.0, avail[1] - control_height);
-
-    if (zgui.beginChild("ControlPanel", .{ .w = -1, .h = control_height })) {
-        const panel_avail = zgui.getContentRegionAvail();
-        var right_width = @max(280.0, panel_avail[0] * 0.28);
-        if (right_width > panel_avail[0] - 260.0) {
-            right_width = @max(220.0, panel_avail[0] * 0.34);
-        }
-        const left_width = @max(220.0, panel_avail[0] - right_width - 16.0);
-
-        if (zgui.beginChild("ControlLeft", .{ .w = left_width, .h = -1 })) {
-            zgui.spacing();
-
-            zgui.setWindowFontScale(1.58);
-            zgui.textColored(.{ 0.925, 0.914, 0.890, 1.0 }, "Script: {s}", .{tab.title});
-            zgui.setWindowFontScale(1.0);
-            zgui.dummy(.{ .w = 0.0, .h = 10.0 });
-
-            const card_bg = [4]f32{ 0.067, 0.067, 0.071, 1.0 };
-            const card_border = [4]f32{ 0.165, 0.149, 0.129, 1.0 };
-            const header_bg = [4]f32{ 0.118, 0.106, 0.094, 1.0 };
-            const header_text = [4]f32{ 0.925, 0.890, 0.824, 1.0 };
-
-            zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = card_bg });
-            zgui.pushStyleColor4f(.{ .idx = .border, .c = card_border });
-            zgui.pushStyleColor4f(.{ .idx = .frame_bg, .c = [4]f32{ 0.082, 0.078, 0.075, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .frame_bg_hovered, .c = [4]f32{ 0.102, 0.094, 0.086, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .frame_bg_active, .c = [4]f32{ 0.118, 0.106, 0.094, 1.0 } });
-            zgui.pushStyleVar1f(.{ .idx = .child_border_size, .v = 1.0 });
-            zgui.pushStyleVar1f(.{ .idx = .child_rounding, .v = 8.0 });
-            defer zgui.popStyleVar(.{ .count = 2 });
-            defer zgui.popStyleColor(.{ .count = 5 });
-
-            if (zgui.beginChild("DescSection", .{ .w = -1, .h = 100.0 })) {
-                zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = header_bg });
-                if (zgui.beginChild("DescHeader", .{ .w = -1, .h = 40.0 })) {
-                    zgui.setCursorPosY(zgui.getCursorPosY() + 8.0);
-                    zgui.setWindowFontScale(detail_font_scale);
-                    zgui.textColored(header_text, "Description", .{});
-                    zgui.setWindowFontScale(1.0);
-                }
-                zgui.endChild();
-                zgui.popStyleColor(.{ .count = 1 });
-
-                zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 14.0, 12.0 } });
-                zgui.setWindowFontScale(detail_font_scale);
-                zgui.setNextItemWidth(-1);
-                _ = zgui.inputText("##description", .{ .buf = tab.description[0..511 :0] });
-                zgui.setWindowFontScale(1.0);
-                zgui.popStyleVar(.{ .count = 1 });
-            }
-            zgui.endChild();
-
-            zgui.dummy(.{ .w = 0.0, .h = 6.0 });
-            if (zgui.beginChild("CmdSection", .{ .w = -1, .h = 100.0 })) {
-                zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = header_bg });
-                if (zgui.beginChild("CmdHeader", .{ .w = -1, .h = 40.0 })) {
-                    zgui.setCursorPosY(zgui.getCursorPosY() + 8.0);
-                    zgui.setWindowFontScale(detail_font_scale);
-                    zgui.textColored(header_text, "Command", .{});
-                    zgui.setWindowFontScale(1.0);
-                }
-                zgui.endChild();
-                zgui.popStyleColor(.{ .count = 1 });
-
-                zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 14.0, 12.0 } });
-                zgui.setWindowFontScale(detail_font_scale);
-                zgui.setNextItemWidth(-1);
-                _ = zgui.inputText("##command", .{ .buf = tab.command[0..511 :0] });
-                zgui.setWindowFontScale(1.0);
-                zgui.popStyleVar(.{ .count = 1 });
-            }
-            zgui.endChild();
-
-            zgui.dummy(.{ .w = 0.0, .h = 6.0 });
-            const remaining_h = zgui.getContentRegionAvail()[1];
-            if (zgui.beginChild("ParamSection", .{ .w = -1, .h = @max(120.0, remaining_h) })) {
-                zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = header_bg });
-                if (zgui.beginChild("ParamHeader", .{ .w = -1, .h = 44.0 })) {
-                    const header_width = zgui.getContentRegionAvail()[0];
-                    zgui.setCursorPosY(zgui.getCursorPosY() + 8.0);
-                    zgui.setWindowFontScale(detail_font_scale);
-                    zgui.textColored(header_text, "Parameters", .{});
-                    zgui.setWindowFontScale(1.0);
-                    zgui.sameLine(.{ .spacing = 8.0 });
-                    zgui.setCursorPosX(@max(0.0, header_width - 96.0));
-                    zgui.setWindowFontScale(detail_font_scale);
-                    if (zgui.button("+ Add", .{ .w = 90, .h = 30 })) {
-                        tab.parameters.append(ScriptParameter.init()) catch {};
-                    }
-                    zgui.setWindowFontScale(1.0);
-                }
-                zgui.endChild();
-                zgui.popStyleColor(.{ .count = 1 });
-
-                zgui.spacing();
-                const param_list_height = @max(74.0, zgui.getContentRegionAvail()[1] - 8.0);
-                if (zgui.beginChild("ParamList", .{ .w = -1, .h = param_list_height })) {
-                    const row_width = zgui.getContentRegionAvail()[0];
-                    const name_width = row_width * 0.30;
-                    const value_width = row_width * 0.58;
-                    const remove_width = @max(36.0, row_width - name_width - value_width - 20.0);
-
-                    zgui.setWindowFontScale(detail_font_scale);
-                    zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 10.0, 8.0 } });
-                    defer zgui.popStyleVar(.{ .count = 1 });
-                    zgui.textDisabled("Name", .{});
-                    zgui.sameLine(.{ .spacing = 8.0 });
-                    zgui.setCursorPosX(zgui.getCursorPosX() + name_width + 4.0);
-                    zgui.textDisabled("Value", .{});
-                    zgui.spacing();
-
-                    var i: usize = 0;
-                    var to_remove: ?usize = null;
-                    while (i < tab.parameters.items.len) : (i += 1) {
-                        var param = &tab.parameters.items[i];
-
-                        var name_id_buf: [40:0]u8 = undefined;
-                        const name_id = std.fmt.bufPrintZ(&name_id_buf, "##pname{d}", .{i}) catch "##pname";
-                        zgui.setNextItemWidth(name_width);
-                        _ = zgui.inputText(name_id, .{ .buf = param.name[0..127 :0] });
-
-                        zgui.sameLine(.{ .spacing = 8.0 });
-                        var value_id_buf: [40:0]u8 = undefined;
-                        const value_id = std.fmt.bufPrintZ(&value_id_buf, "##pval{d}", .{i}) catch "##pval";
-                        zgui.setNextItemWidth(value_width);
-                        _ = zgui.inputText(value_id, .{ .buf = param.value[0..255 :0] });
-
-                        zgui.sameLine(.{ .spacing = 8.0 });
-                        var remove_id_buf: [40:0]u8 = undefined;
-                        const remove_id = std.fmt.bufPrintZ(&remove_id_buf, "X##prm{d}", .{i}) catch "X##prm";
-                        zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-                        zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.235, 0.192, 0.196, 1.0 } });
-                        if (zgui.button(remove_id, .{ .w = remove_width, .h = 38 })) {
-                            to_remove = i;
-                        }
-                        zgui.popStyleColor(.{ .count = 2 });
-
-                        zgui.spacing();
-                    }
-                    zgui.setWindowFontScale(1.0);
-
-                    if (to_remove) |idx| {
-                        _ = tab.parameters.orderedRemove(idx);
-                    }
-                }
-                zgui.endChild();
-            }
-            zgui.endChild();
-        }
-        zgui.endChild();
-
-        zgui.sameLine(.{ .spacing = 16.0 });
-        if (zgui.beginChild("ControlRight", .{ .w = -1, .h = -1 })) {
-            const is_running = if (tab.script_executor) |*exec| exec.isRunning() else false;
-            const col_gap: f32 = 12.0;
-            const row_gap: f32 = 28.0;
-            const btn_height: f32 = 58.0;
-            const width = zgui.getContentRegionAvail()[0];
-            const btn_width = @max(90.0, (width - col_gap) * 0.5);
-            const layout_height = btn_height * 2.0 + row_gap;
-            const vertical_pad = @max(0.0, (zgui.getContentRegionAvail()[1] - layout_height) * 0.5);
-
-            if (vertical_pad > 0) {
-                zgui.dummy(.{ .w = 0, .h = vertical_pad });
-            }
-            zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 10.0, 10.0 } });
-            zgui.setWindowFontScale(detail_font_scale);
-            defer zgui.popStyleVar(.{ .count = 1 });
-            defer zgui.setWindowFontScale(1.0);
-
-            zgui.beginDisabled(.{ .disabled = is_running });
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.220, 0.247, 0.220, 1.0 } });
-            if (zgui.button("Run", .{ .w = btn_width, .h = btn_height })) {
-                if (executeScriptFromTab(app_state, tab)) {
-                    app_state.showSuccessToast("Execution started");
-                }
-            }
-            zgui.popStyleColor(.{ .count = 2 });
-            zgui.endDisabled();
-
-            zgui.sameLine(.{ .spacing = col_gap });
-            zgui.beginDisabled(.{ .disabled = !is_running });
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.188, 0.176, 0.165, 1.0 } });
-            if (zgui.button("Stop", .{ .w = btn_width, .h = btn_height })) {
-                if (tab.script_executor) |*exec| {
-                    var mut_exec = exec.*;
-                    mut_exec.stop();
-                    tab.script_executor = mut_exec;
-                    app_state.showSuccessToast("Execution stopped");
-                }
-            }
-            zgui.popStyleColor(.{ .count = 2 });
-            zgui.endDisabled();
-
-            zgui.dummy(.{ .w = 0, .h = row_gap });
-
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.212, 0.224, 0.239, 1.0 } });
-            if (zgui.button("Save", .{ .w = btn_width, .h = btn_height })) {
-                const saved = blk: {
-                    saveTabConfig(app_state, tab) catch |err| {
-                        var msg_buf: [160]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&msg_buf, "Save failed: {s}", .{@errorName(err)}) catch "Save failed";
-                        app_state.showErrorToast(msg);
-                        break :blk false;
-                    };
-                    break :blk true;
-                };
-                if (saved) {
-                    app_state.showSuccessToast("Saved");
-                }
-            }
-            zgui.popStyleColor(.{ .count = 2 });
-
-            zgui.sameLine(.{ .spacing = col_gap });
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.235, 0.192, 0.196, 1.0 } });
-            if (zgui.button("Remove", .{ .w = btn_width, .h = btn_height })) {
-                if (tab.script_path) |path| {
-                    app_state.requestRemoveScript(path, tab.title) catch {};
-                }
-            }
-            zgui.popStyleColor(.{ .count = 2 });
-        }
-        zgui.endChild();
-    }
-    zgui.endChild();
-
-    zgui.setWindowFontScale(detail_font_scale);
-    zgui.text("Output:", .{});
-    zgui.setWindowFontScale(detail_font_scale);
-    zgui.sameLine(.{ .spacing = 12.0 });
-
-    const output_slice = if (tab.script_executor) |*exec| exec.getOutput() else "";
-    const output_view = if (tab.show_full_output)
-        output_slice
-    else
-        tailOutputView(output_slice, 300, 64 * 1024);
-
-    if (zgui.button(if (tab.show_full_output) "Show Tail" else "Show Full", .{ .w = 136, .h = 38 })) {
-        tab.show_full_output = !tab.show_full_output;
-    }
-    zgui.sameLine(.{ .spacing = 8.0 });
-    if (zgui.button("Clear", .{ .w = 96, .h = 38 })) {
-        if (tab.script_executor) |*exec| {
-            var mut_exec = exec.*;
-            mut_exec.clearOutput();
-            tab.script_executor = mut_exec;
-        }
-    }
-    zgui.sameLine(.{ .spacing = 8.0 });
-    if (zgui.button("Copy", .{ .w = 96, .h = 38 })) {
-        _ = copyTextToClipboard(app_state.allocator, output_view);
-    }
-    zgui.sameLine(.{ .spacing = 10.0 });
-    _ = zgui.checkbox("Auto-scroll", .{ .v = &tab.output_auto_scroll });
-    zgui.setWindowFontScale(1.0);
-    zgui.spacing();
-
-    if (zgui.beginChild("OutputPanel", .{ .w = -1, .h = output_height - 56.0 })) {
-        zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = [4]f32{ 0.055, 0.052, 0.049, 1.0 } });
-        defer zgui.popStyleColor(.{ .count = 1 });
-
-        zgui.spacing();
-        zgui.indent(.{ .indent_w = 10 });
-        defer zgui.unindent(.{ .indent_w = 10 });
-
-        if (output_view.len > 0) {
-            zgui.setWindowFontScale(detail_font_scale);
-            zgui.textUnformatted(output_view);
-            zgui.setWindowFontScale(1.0);
-            if (tab.output_auto_scroll) {
-                zgui.setScrollHereY(.{ .center_y_ratio = 1.0 });
-            }
-            if (!tab.show_full_output and output_view.len < output_slice.len) {
-                zgui.spacing();
-                zgui.setWindowFontScale(detail_font_scale);
-                zgui.textColored(.{ 0.545, 0.522, 0.490, 1.0 }, "... truncated, switch to Show Full for complete output", .{});
-                zgui.setWindowFontScale(1.0);
-            }
-        } else {
-            zgui.setWindowFontScale(detail_font_scale);
-            zgui.textColored(.{ 0.655, 0.624, 0.584, 1.0 }, "Waiting for execution...", .{});
-            zgui.setWindowFontScale(1.0);
-        }
-    }
-    zgui.endChild();
-}
-
-/// 保存标签页配置
-fn saveTabConfig(app_state: *AppState, tab: *Tab) !void {
-    if (tab.script_path) |path| {
-        // 获取描述
-        const desc_len = std.mem.indexOfScalar(u8, &tab.description, 0) orelse tab.description.len;
-        const description = tab.description[0..desc_len];
-
-        // 获取命令
-        const cmd_len = std.mem.indexOfScalar(u8, &tab.command, 0) orelse tab.command.len;
-        const command = tab.command[0..cmd_len];
-
-        // 构建参数列表
-        var params = std.ArrayList(config.ParameterConfig).init(app_state.allocator);
-        defer params.deinit();
-
-        for (tab.parameters.items) |*param| {
-            const name_len = std.mem.indexOfScalar(u8, &param.name, 0) orelse param.name.len;
-            const value_len = std.mem.indexOfScalar(u8, &param.value, 0) orelse param.value.len;
-
-            // 只保存有名称的参数
-            if (name_len > 0) {
-                params.append(.{
-                    .name = param.name[0..name_len],
-                    .value = param.value[0..value_len],
-                }) catch continue;
-            }
-        }
-
-        // 保存配置
-        try app_state.config_manager.saveScriptConfig(path, description, command, params.items);
-        try app_state.rebuildCardMetaForScript(path);
-    }
-}
-
-/// 保存添加的路径列表
-fn saveAddedPaths(app_state: *AppState) !void {
-    var paths = std.ArrayList(config.PathConfig).init(app_state.allocator);
-    defer paths.deinit();
-
-    for (app_state.added_paths.items) |entry| {
-        paths.append(.{
-            .path = entry.path,
-            .is_directory = entry.is_directory,
-        }) catch continue;
-    }
-
-    try app_state.config_manager.savePaths(paths.items);
 }

@@ -3,8 +3,9 @@ const script = @import("script.zig");
 
 const CACHE_DIR = ".zscripts";
 const SCAN_INDEX_FILE = "scan_index.json";
-const SCAN_CACHE_VERSION: u32 = 2;
+const SCAN_CACHE_VERSION: u32 = 3;
 const CACHE_WRITE_INTERVAL_MS: i64 = 500;
+const CACHE_STALENESS_MS: i64 = 5 * 60 * 1000; // 5 分钟后缓存视为过期
 
 const FileFingerprint = struct {
     mtime: i128,
@@ -27,6 +28,7 @@ const PersistedScanRootEntry = struct {
 
 const PersistedScanIndex = struct {
     version: u32,
+    last_scan_ms: i64,
     scan_roots: []PersistedScanRootEntry,
     scripts: []PersistedScriptEntry,
 };
@@ -48,6 +50,7 @@ pub const Scanner = struct {
     last_cache_hash: u64,
     last_cache_hash_valid: bool,
     last_cache_write_ms: i64,
+    last_scan_ms: i64,
 
     pub fn init(allocator: std.mem.Allocator) Scanner {
         var cache_dir_path: ?[]const u8 = null;
@@ -73,6 +76,7 @@ pub const Scanner = struct {
             .last_cache_hash = 0,
             .last_cache_hash_valid = false,
             .last_cache_write_ms = 0,
+            .last_scan_ms = 0,
         };
     }
 
@@ -294,6 +298,7 @@ pub const Scanner = struct {
         }
 
         try self.rebuildScriptIndex();
+        self.last_scan_ms = std.time.milliTimestamp();
     }
 
     /// 从持久化缓存恢复脚本索引。返回 true 表示缓存文件读取成功。
@@ -322,6 +327,12 @@ pub const Scanner = struct {
             return false;
         }
 
+        // 缓存过期检查
+        const now_ms = std.time.milliTimestamp();
+        if (parsed.value.last_scan_ms > 0 and now_ms - parsed.value.last_scan_ms > CACHE_STALENESS_MS) {
+            return false;
+        }
+
         self.clear();
         for (parsed.value.scripts) |cached_script| {
             if (!isScriptFile(cached_script.path)) continue;
@@ -335,6 +346,7 @@ pub const Scanner = struct {
         }
 
         try self.rebuildScriptIndex();
+        self.last_scan_ms = parsed.value.last_scan_ms;
         return true;
     }
 
@@ -374,6 +386,7 @@ pub const Scanner = struct {
 
         const payload = PersistedScanIndex{
             .version = SCAN_CACHE_VERSION,
+            .last_scan_ms = self.last_scan_ms,
             .scan_roots = persisted_roots.items,
             .scripts = persisted_scripts.items,
         };
@@ -412,6 +425,7 @@ pub const Scanner = struct {
 
         try self.scanDirectoryRecursive(dir_path, &touch_flags);
         try self.rebuildScriptIndex();
+        self.last_scan_ms = std.time.milliTimestamp();
     }
 
     /// 获取扫描到的脚本列表
@@ -429,3 +443,7 @@ pub const Scanner = struct {
         self.fingerprints.clearRetainingCapacity();
     }
 };
+
+test {
+    _ = @import("scanner_test.zig");
+}

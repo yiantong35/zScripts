@@ -72,3 +72,7 @@ pub const Script = struct {
         return cmd.toOwnedSlice();
     }
 };
+
+test {
+    _ = @import("script_test.zig");
+}
