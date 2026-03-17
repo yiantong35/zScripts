@@ -200,9 +200,9 @@ pub fn render(app_state: *AppState) void {
         if (zgui.beginChild("EmptyState", .{ .w = -1, .h = 220 })) {
             const empty_text = if (is_searching) "No matching scripts" else "No scripts yet";
             const hint_text = if (is_searching) "Try a different search term." else "Click Add Scripts to import your first script.";
-            const empty_scale: f32 = 1.34;
-            const hint_scale: f32 = 1.14;
-            const line_gap: f32 = 18.0;
+            const empty_scale: f32 = 1.46;
+            const hint_scale: f32 = 1.20;
+            const line_gap: f32 = 24.0;
             const child_avail = zgui.getContentRegionAvail();
 
             zgui.setWindowFontScale(empty_scale);
@@ -215,19 +215,15 @@ pub fn render(app_state: *AppState) void {
             const total_text_h = empty_text_size[1] + line_gap + hint_text_size[1];
             const start_y = @max(0.0, (child_avail[1] - total_text_h) * 0.5);
             const child_width = child_avail[0];
+            const empty_x = @max(0.0, (child_width - empty_text_size[0]) * 0.5);
+            const hint_x = @max(0.0, (child_width - hint_text_size[0]) * 0.5);
 
-            zgui.setCursorPosY(start_y);
-            if (child_width > empty_text_size[0]) {
-                zgui.setCursorPosX((child_width - empty_text_size[0]) * 0.5);
-            }
+            zgui.setCursorPos(.{ empty_x, start_y });
             zgui.setWindowFontScale(empty_scale);
             zgui.textColored(.{ 0.925, 0.914, 0.890, 1.0 }, "{s}", .{empty_text});
             zgui.setWindowFontScale(1.0);
 
-            zgui.setCursorPosY(start_y + empty_text_size[1] + line_gap);
-            if (child_width > hint_text_size[0]) {
-                zgui.setCursorPosX((child_width - hint_text_size[0]) * 0.5);
-            }
+            zgui.setCursorPos(.{ hint_x, start_y + empty_text_size[1] + line_gap });
             zgui.setWindowFontScale(hint_scale);
             zgui.textColored(.{ 0.655, 0.624, 0.584, 1.0 }, "{s}", .{hint_text});
             zgui.setWindowFontScale(1.0);
@@ -255,58 +251,64 @@ pub fn render(app_state: *AppState) void {
 
         // 分页控件
         if (total_pages > 1) {
-            zgui.spacing();
+            if (zgui.beginChild("PaginationArea", .{ .w = -1, .h = pagination_height })) {
+                const btn_w: f32 = 92;
+                const btn_h: f32 = 38;
+                const group_spacing: f32 = 20.0;
 
-            var page_buf: [64]u8 = undefined;
-            const page_text = std.fmt.bufPrint(&page_buf, "Page {d} / {d}", .{ app_state.current_page + 1, total_pages }) catch "Page";
-            const page_text_size = zgui.calcTextSize(page_text, .{});
-            const btn_w: f32 = 92;
-            const btn_h: f32 = 38;
-            const group_spacing: f32 = 20.0;
-            const page_group_w = btn_w + group_spacing + page_text_size[0] + group_spacing + btn_w;
-            const remaining_space = zgui.getContentRegionAvail();
-            const vertical_offset = @max(0.0, (remaining_space[1] - btn_h) * 0.5);
-            if (vertical_offset > 0.0) {
-                zgui.dummy(.{ .w = 0.0, .h = vertical_offset });
-            }
+                var page_buf: [64]u8 = undefined;
+                const page_text = std.fmt.bufPrint(&page_buf, "Page {d} / {d}", .{ app_state.current_page + 1, total_pages }) catch "Page";
+                const page_text_size = zgui.calcTextSize(page_text, .{});
+                const page_slot_w = @max(112.0, page_text_size[0] + 8.0);
+                const page_group_w = btn_w + group_spacing + page_slot_w + group_spacing + btn_w;
+                const child_avail = zgui.getContentRegionAvail();
+                const start_x = @max(0.0, (child_avail[0] - page_group_w) * 0.5);
+                const start_y = @max(0.0, (child_avail[1] - btn_h) * 0.5);
 
-            const row_y = zgui.getCursorPosY();
-            const row_x = zgui.getCursorPosX();
-            if (remaining_space[0] > page_group_w) {
-                zgui.setCursorPosX(row_x + (remaining_space[0] - page_group_w) * 0.5);
-            }
+                zgui.setCursorPos(.{ start_x, start_y });
 
-            zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.188, 0.176, 0.165, 1.0 } });
-            zgui.pushStyleColor4f(.{ .idx = .button_active, .c = [4]f32{ 0.227, 0.212, 0.196, 1.0 } });
+                zgui.pushStyleColor4f(.{ .idx = .button, .c = [4]f32{ 0.145, 0.137, 0.129, 1.0 } });
+                zgui.pushStyleColor4f(.{ .idx = .button_hovered, .c = [4]f32{ 0.188, 0.176, 0.165, 1.0 } });
+                zgui.pushStyleColor4f(.{ .idx = .button_active, .c = [4]f32{ 0.227, 0.212, 0.196, 1.0 } });
 
-            if (app_state.current_page > 0) {
-                if (zgui.button("< Prev", .{ .w = btn_w, .h = btn_h })) {
-                    app_state.current_page -= 1;
+                if (app_state.current_page > 0) {
+                    if (zgui.button("< Prev", .{ .w = btn_w, .h = btn_h })) {
+                        app_state.current_page -= 1;
+                    }
+                } else {
+                    zgui.pushStyleColor4f(.{ .idx = .text, .c = [4]f32{ 0.4, 0.4, 0.4, 1.0 } });
+                    _ = zgui.button("< Prev", .{ .w = btn_w, .h = btn_h });
+                    zgui.popStyleColor(.{ .count = 1 });
                 }
-            } else {
-                zgui.pushStyleColor4f(.{ .idx = .text, .c = [4]f32{ 0.4, 0.4, 0.4, 1.0 } });
-                _ = zgui.button("< Prev", .{ .w = btn_w, .h = btn_h });
-                zgui.popStyleColor(.{ .count = 1 });
-            }
 
-            zgui.sameLine(.{ .spacing = group_spacing });
-            zgui.setCursorPosY(row_y + (btn_h - page_text_size[1]) * 0.5);
-            zgui.text("{s}", .{page_text});
-            zgui.sameLine(.{ .spacing = group_spacing });
-            zgui.setCursorPosY(row_y);
-
-            if (app_state.current_page < total_pages - 1) {
-                if (zgui.button("Next >", .{ .w = btn_w, .h = btn_h })) {
-                    app_state.current_page += 1;
+                zgui.sameLine(.{ .spacing = group_spacing });
+                zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = [4]f32{ 0.0, 0.0, 0.0, 0.0 } });
+                zgui.pushStyleVar1f(.{ .idx = .child_border_size, .v = 0.0 });
+                if (zgui.beginChild("PaginationLabel", .{ .w = page_slot_w, .h = btn_h })) {
+                    const label_x = @max(0.0, (page_slot_w - page_text_size[0]) * 0.5);
+                    const label_y = @max(0.0, (btn_h - page_text_size[1]) * 0.5);
+                    zgui.setCursorPos(.{ label_x, label_y });
+                    zgui.text("{s}", .{page_text});
                 }
-            } else {
-                zgui.pushStyleColor4f(.{ .idx = .text, .c = [4]f32{ 0.4, 0.4, 0.4, 1.0 } });
-                _ = zgui.button("Next >", .{ .w = btn_w, .h = btn_h });
+                zgui.endChild();
+                zgui.popStyleVar(.{ .count = 1 });
                 zgui.popStyleColor(.{ .count = 1 });
-            }
+                zgui.sameLine(.{ .spacing = group_spacing });
+                zgui.setCursorPosY(start_y);
 
-            zgui.popStyleColor(.{ .count = 3 });
+                if (app_state.current_page < total_pages - 1) {
+                    if (zgui.button("Next >", .{ .w = btn_w, .h = btn_h })) {
+                        app_state.current_page += 1;
+                    }
+                } else {
+                    zgui.pushStyleColor4f(.{ .idx = .text, .c = [4]f32{ 0.4, 0.4, 0.4, 1.0 } });
+                    _ = zgui.button("Next >", .{ .w = btn_w, .h = btn_h });
+                    zgui.popStyleColor(.{ .count = 1 });
+                }
+
+                zgui.popStyleColor(.{ .count = 3 });
+            }
+            zgui.endChild();
         }
     }
 }

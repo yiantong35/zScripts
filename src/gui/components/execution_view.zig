@@ -9,15 +9,12 @@ const Tab = app_mod.Tab;
 /// 渲染执行输出面板（工具栏 + 输出内容）
 pub fn render(app_state: *AppState, tab: *Tab, output_height: f32, detail_font_scale: f32) void {
     const toolbar_button_h: f32 = 38.0;
-    const toolbar_row_y = zgui.getCursorPosY();
     const output_label = "Output:";
     zgui.setWindowFontScale(detail_font_scale);
-    const output_label_size = zgui.calcTextSize(output_label, .{});
-    zgui.setCursorPosY(toolbar_row_y + (toolbar_button_h - output_label_size[1]) * 0.5);
+    zgui.alignTextToFramePadding();
     zgui.text(output_label, .{});
     zgui.setWindowFontScale(detail_font_scale);
     zgui.sameLine(.{ .spacing = 12.0 });
-    zgui.setCursorPosY(toolbar_row_y);
 
     const output_slice = if (tab.script_executor) |*exec| exec.getOutput() else "";
     const output_view = if (tab.show_full_output)

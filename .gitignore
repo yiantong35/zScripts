@@ -9,6 +9,7 @@ imgui.ini
 
 # macOS
 .DS_Store
+._*
 
 # IDE
 .vscode/
@@ -22,6 +23,8 @@ imgui.ini
 .codex/
 
 # Project docs (local only)
+CHANGELOG.md
+analysis-report.md
 CLAUDE.md
 PROJECT_STATUS.md
 TROUBLESHOOTING.md

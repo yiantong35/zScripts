@@ -1,51 +1,62 @@
 # zScripts
 
-macOS 桌面应用，用于管理和执行 Python / Shell 自动化脚本。基于 Zig 0.14 + zgui (ImGui) 构建。
+`zScripts` 是一个 macOS 桌面应用，用来管理和执行 Python / Shell 自动化脚本。  
+项目基于 Zig 0.14 + zgui（ImGui）构建，当前默认可产出 macOS `.app` bundle。
 
 ## 功能
 
-- 卡片式首页，4×3 网格展示脚本，支持分页
-- 双击卡片打开脚本标签页，编辑描述、命令、参数
-- 非阻塞脚本执行，实时输出捕获
-- 执行命令完全自定义，用户可自由配置任意命令和参数
-- 支持中文输入和显示（STHeiti 字体合并）
-- 原生 macOS 文件选择器（NSOpenPanel）
-- Cmd+1~9 快捷键切换标签页
-- JSON 持久化配置（`~/.zscripts/`）
-
-## 截图
-
-（待添加）
+- 首页 4×3 卡片网格，支持分页、搜索、卡片 hover 提示
+- 双击卡片打开脚本页，右键卡片可 `Remove from zScripts`
+- 脚本页支持编辑描述、命令、参数，并可运行 / 停止 / 保存 / 删除
+- 输出区支持 `Show Full / Show Tail`、清空、复制、自动滚动
+- 参数超过 4 个时，首页摘要保持精简，hover 可查看完整参数
+- 原生 macOS 文件选择器（`NSOpenPanel`）
+- 软删除脚本：仅从 zScripts 隐藏，不删除磁盘文件
+- 启动优先走扫描缓存，减少二次启动扫描时间
+- 支持中文输入和显示
+- 提供 macOS `.app` 打包与自定义应用图标
 
 ## 构建与运行
 
 ### 前置条件
 
-- Zig 0.14.1（不兼容 0.15+）
-- Git LFS
 - macOS
+- Zig 0.14.1
+- Xcode Command Line Tools
 
 ```bash
-# 安装 Zig 0.14
 brew install zig@0.14
+```
 
-# 安装 Git LFS
-brew install git-lfs && git lfs install
+建议确保 Zig 0.14 在 PATH 中：
+
+```bash
+export PATH="/opt/homebrew/opt/zig@0.14/bin:$PATH"
 ```
 
 ### 构建
 
 ```bash
-export PATH="/opt/homebrew/opt/zig@0.14/bin:$PATH"
 zig build
 ```
 
-首次构建约 5-10 分钟（编译所有依赖）。
+构建完成后会得到：
+
+- 可执行文件：`zig-out/bin/zScripts`
+- macOS App：`zig-out/zScripts.app`
 
 ### 运行
 
+开发运行：
+
 ```bash
 zig build run
+```
+
+以 App 形式打开：
+
+```bash
+open zig-out/zScripts.app
 ```
 
 ### 测试
@@ -58,34 +69,75 @@ zig build test
 
 | 快捷键 | 功能 |
 |--------|------|
-| Cmd+1~9 | 切换到对应标签页 |
+| `Cmd+1` ~ `Cmd+9` | 切换到对应标签页 |
+
+## 数据存储
+
+配置目录位于：
+
+```text
+~/.zscripts/
+```
+
+主要文件：
+
+- `paths.json`：已添加的目录 / 文件路径
+- `scripts.json`：脚本描述、命令、参数配置
+- `hidden_scripts.json`：软删除隐藏列表
+- `history.json`：最近执行历史
+- `scan_index.json`：扫描结果缓存
+- `perf.jsonl`：性能日志（开启 Perf Log 时）
 
 ## 技术栈
 
-- **语言：** Zig 0.14.1
-- **GUI：** zgui 0.6.0-dev（ImGui 绑定）
-- **窗口：** zglfw 0.10.0-dev（GLFW 绑定）
-- **渲染：** zopengl 0.6.0-dev（OpenGL 3.3 Core Profile）
-- **文件选择器：** Objective-C（NSOpenPanel）
+- Zig 0.14.1
+- zgui 0.6.0-dev
+- zglfw 0.10.0-dev
+- zopengl 0.6.0-dev
+- OpenGL 3.3 Core Profile
+- Objective-C `NSOpenPanel`
 
 ## 项目结构
 
-```
+```text
 src/
-├── main.zig              # 应用入口，初始化，事件循环
+├── main.zig
 ├── core/
-│   ├── script.zig        # 脚本数据模型
-│   ├── executor.zig      # 脚本执行引擎
-│   ├── scanner.zig       # 目录扫描器
-│   ├── perf_monitor.zig  # 性能监控
-│   ├── file_picker.zig   # 文件选择器 Zig 封装
-│   └── file_picker.m     # Objective-C NSOpenPanel 实现
+│   ├── executor.zig
+│   ├── file_picker.m
+│   ├── file_picker.zig
+│   ├── perf_monitor.zig
+│   ├── scanner.zig
+│   └── script.zig
 ├── gui/
-│   └── app.zig           # 主 GUI 逻辑，标签管理，UI 渲染
+│   ├── app.zig
+│   ├── components/
+│   │   ├── card.zig
+│   │   ├── execution_view.zig
+│   │   ├── home_page.zig
+│   │   └── script_editor.zig
+│   └── utils/
+│       ├── layout.zig
+│       └── text_utils.zig
 └── storage/
-    └── config.zig        # JSON 持久化
+    └── config.zig
+
+tools/
+└── generate_app_icon.swift
 ```
 
+说明：
+
+- 单元测试文件按模块放在源码旁边，命名为 `*_test.zig`
+- `tools/generate_app_icon.swift` 是 macOS `.app` 图标生成脚本，属于构建所需文件
+
+## 当前状态
+
+目前项目已可日常使用，适合：
+
+- 管理一批本地 Python / Shell 脚本
+- 为脚本保存参数模板
+- 直接在桌面 GUI 中运行并查看输出
 
 ## License
 

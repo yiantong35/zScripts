@@ -733,8 +733,8 @@ pub const AppState = struct {
         }
 
         // 微调标签内边距和内部间距，让关闭按钮更贴近右侧
-        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 16.0, 18.0 } });
-        zgui.pushStyleVar2f(.{ .idx = .item_inner_spacing, .v = [2]f32{ 8.0, 8.0 } });
+        zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 12.0, 18.0 } });
+        zgui.pushStyleVar2f(.{ .idx = .item_inner_spacing, .v = [2]f32{ 4.0, 8.0 } });
         defer zgui.popStyleVar(.{ .count = 2 });
 
         // 增加标签文字大小
