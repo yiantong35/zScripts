@@ -6,10 +6,12 @@ const script_mod = @import("../../core/script.zig");
 const executor = @import("../../core/executor.zig");
 const config = @import("../../storage/config.zig");
 const execution_view = @import("execution_view.zig");
+const layout = @import("../utils/layout.zig");
 
 const AppState = app_mod.AppState;
 const Tab = app_mod.Tab;
 const ScriptParameter = app_mod.ScriptParameter;
+const showItemTooltip = layout.showItemTooltip;
 
 /// 渲染脚本标签页
 pub fn render(app_state: *AppState, tab: *Tab) void {
@@ -178,9 +180,10 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
 
 fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
     const row_width = zgui.getContentRegionAvail()[0];
-    const name_width = row_width * 0.30;
-    const value_width = row_width * 0.58;
-    const remove_width = @max(36.0, row_width - name_width - value_width - 20.0);
+    const name_width = row_width * 0.22;
+    const usage_width = row_width * 0.33;
+    const value_width = row_width * 0.37;
+    const remove_width = @max(36.0, row_width - name_width - usage_width - value_width - 24.0);
 
     zgui.setWindowFontScale(detail_font_scale);
     zgui.pushStyleVar2f(.{ .idx = .frame_padding, .v = [2]f32{ 10.0, 8.0 } });
@@ -188,6 +191,9 @@ fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
     zgui.textDisabled("Name", .{});
     zgui.sameLine(.{ .spacing = 8.0 });
     zgui.setCursorPosX(zgui.getCursorPosX() + name_width + 4.0);
+    zgui.textDisabled("Usage", .{});
+    zgui.sameLine(.{ .spacing = 8.0 });
+    zgui.setCursorPosX(zgui.getCursorPosX() + usage_width + 4.0);
     zgui.textDisabled("Value", .{});
     zgui.spacing();
 
@@ -200,6 +206,19 @@ fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
         const name_id = std.fmt.bufPrintZ(&name_id_buf, "##pname{d}", .{i}) catch "##pname";
         zgui.setNextItemWidth(name_width);
         _ = zgui.inputText(name_id, .{ .buf = param.name[0..127 :0] });
+
+        zgui.sameLine(.{ .spacing = 8.0 });
+        var usage_id_buf: [40:0]u8 = undefined;
+        const usage_id = std.fmt.bufPrintZ(&usage_id_buf, "##pusage{d}", .{i}) catch "##pusage";
+        zgui.setNextItemWidth(usage_width);
+        _ = zgui.inputTextWithHint(usage_id, .{
+            .hint = "what this param does",
+            .buf = param.usage[0..255 :0],
+        });
+        const usage_len = std.mem.indexOfScalar(u8, &param.usage, 0) orelse param.usage.len;
+        if (usage_len > 0) {
+            showItemTooltip(param.usage[0..usage_len]);
+        }
 
         zgui.sameLine(.{ .spacing = 8.0 });
         var value_id_buf: [40:0]u8 = undefined;
@@ -371,12 +390,14 @@ pub fn saveTabConfig(app_state: *AppState, tab: *Tab) !void {
 
         for (tab.parameters.items) |*param| {
             const name_len = std.mem.indexOfScalar(u8, &param.name, 0) orelse param.name.len;
+            const usage_len = std.mem.indexOfScalar(u8, &param.usage, 0) orelse param.usage.len;
             const value_len = std.mem.indexOfScalar(u8, &param.value, 0) orelse param.value.len;
 
             // 只保存有名称的参数
             if (name_len > 0) {
                 params.append(.{
                     .name = param.name[0..name_len],
+                    .usage = param.usage[0..usage_len],
                     .value = param.value[0..value_len],
                 }) catch continue;
             }

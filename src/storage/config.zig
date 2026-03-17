@@ -6,13 +6,14 @@ const CONFIG_FILE = "scripts.json";
 const PATHS_FILE = "paths.json";
 const HIDDEN_SCRIPTS_FILE = "hidden_scripts.json";
 const HISTORY_FILE = "history.json";
-const CONFIG_VERSION: u32 = 2;
+const CONFIG_VERSION: u32 = 3;
 const CONFIG_WRITE_DEBOUNCE_MS: i64 = 300;
 const MAX_HISTORY_ENTRIES: usize = 100;
 
 /// 脚本参数配置
 pub const ParameterConfig = struct {
     name: []const u8,
+    usage: []const u8,
     value: []const u8,
 };
 
@@ -110,6 +111,7 @@ pub const ConfigManager = struct {
             while (i > 0) {
                 i -= 1;
                 self.allocator.free(cloned[i].name);
+                self.allocator.free(cloned[i].usage);
                 self.allocator.free(cloned[i].value);
             }
         }
@@ -117,6 +119,7 @@ pub const ConfigManager = struct {
         for (parameters, 0..) |param, idx| {
             cloned[idx] = .{
                 .name = try self.allocator.dupe(u8, param.name),
+                .usage = try self.allocator.dupe(u8, param.usage),
                 .value = try self.allocator.dupe(u8, param.value),
             };
             i = idx + 1;
@@ -175,6 +178,7 @@ pub const ConfigManager = struct {
                 self.allocator.free(cfg.command);
                 for (cfg.parameters) |param| {
                     self.allocator.free(param.name);
+                    self.allocator.free(param.usage);
                     self.allocator.free(param.value);
                 }
                 self.allocator.free(cfg.parameters);
@@ -256,12 +260,13 @@ pub const ConfigManager = struct {
                 break :blk 1;
             };
             const needs_migration = cfg_version < CONFIG_VERSION;
+            const reset_command_and_parameters = cfg_version < 2;
             if (needs_migration) {
                 self.needs_migration_writeback = true;
             }
 
-            // command 可选；旧版本升级时清空 command/parameters，要求用户重新填写
-            const cmd = if (needs_migration)
+            // 仅非常旧的配置版本需要清空 command/parameters
+            const cmd = if (reset_command_and_parameters)
                 ""
             else if (item.object.get("command")) |c|
                 (if (c == .string) c.string else "")
@@ -269,7 +274,7 @@ pub const ConfigManager = struct {
                 "";
 
             var params = std.ArrayList(ParameterConfig).init(self.allocator);
-            if (!needs_migration) {
+            if (!reset_command_and_parameters) {
                 if (item.object.get("parameters")) |params_json| {
                     if (params_json == .array) {
                         for (params_json.array.items) |param_item| {
@@ -277,9 +282,14 @@ pub const ConfigManager = struct {
                             const name = param_item.object.get("name") orelse continue;
                             const value = param_item.object.get("value") orelse continue;
                             if (name != .string or value != .string) continue;
+                            const usage = if (param_item.object.get("usage")) |usage_json|
+                                (if (usage_json == .string) usage_json.string else "")
+                            else
+                                "";
 
                             try params.append(.{
                                 .name = try self.allocator.dupe(u8, name.string),
+                                .usage = try self.allocator.dupe(u8, usage),
                                 .value = try self.allocator.dupe(u8, value.string),
                             });
                         }
@@ -340,6 +350,7 @@ pub const ConfigManager = struct {
             for (cfg.parameters, 0..) |param, j| {
                 try writer.writeAll("      {\n");
                 try writer.print("        \"name\": \"{s}\",\n", .{param.name});
+                try writer.print("        \"usage\": \"{s}\",\n", .{param.usage});
                 try writer.print("        \"value\": \"{s}\"\n", .{param.value});
                 if (j < cfg.parameters.len - 1) {
                     try writer.writeAll("      },\n");
@@ -368,6 +379,7 @@ pub const ConfigManager = struct {
             self.allocator.free(cfg.command);
             for (cfg.parameters) |param| {
                 self.allocator.free(param.name);
+                self.allocator.free(param.usage);
                 self.allocator.free(param.value);
             }
             self.allocator.free(cfg.parameters);

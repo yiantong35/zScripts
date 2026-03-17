@@ -114,8 +114,8 @@ test "saveScriptConfig and getScriptConfigView: round-trip" {
     defer mgr.deinit();
 
     const params = [_]config.ParameterConfig{
-        .{ .name = "--verbose", .value = "true" },
-        .{ .name = "--output", .value = "/tmp/out" },
+        .{ .name = "--verbose", .usage = "enable verbose log", .value = "true" },
+        .{ .name = "--output", .usage = "output directory", .value = "/tmp/out" },
     };
 
     try mgr.saveScriptConfig("/test/script.py", "Test script", "uv run", &params);
@@ -134,6 +134,7 @@ test "saveScriptConfig and getScriptConfigView: round-trip" {
     try std.testing.expectEqualStrings("uv run", cfg.command);
     try std.testing.expectEqual(@as(usize, 2), cfg.parameters.len);
     try std.testing.expectEqualStrings("--verbose", cfg.parameters[0].name);
+    try std.testing.expectEqualStrings("enable verbose log", cfg.parameters[0].usage);
     try std.testing.expectEqualStrings("true", cfg.parameters[0].value);
 }
 

@@ -73,14 +73,17 @@ pub const TabType = enum {
 /// 脚本参数（用于 UI 输入）
 pub const ScriptParameter = struct {
     name: [128:0]u8, // 参数名缓冲区
+    usage: [256:0]u8, // 参数用途说明缓冲区
     value: [256:0]u8, // 参数值缓冲区
 
     pub fn init() ScriptParameter {
         var param = ScriptParameter{
             .name = undefined,
+            .usage = undefined,
             .value = undefined,
         };
         @memset(&param.name, 0);
+        @memset(&param.usage, 0);
         @memset(&param.value, 0);
         return param;
     }
@@ -688,10 +691,13 @@ pub const AppState = struct {
             for (saved_config.parameters) |param| {
                 var new_param = ScriptParameter.init();
                 const name_len = @min(param.name.len, 127);
+                const usage_len = @min(param.usage.len, 255);
                 const value_len = @min(param.value.len, 255);
                 @memcpy(new_param.name[0..name_len], param.name[0..name_len]);
+                @memcpy(new_param.usage[0..usage_len], param.usage[0..usage_len]);
                 @memcpy(new_param.value[0..value_len], param.value[0..value_len]);
                 new_param.name[name_len] = 0;
+                new_param.usage[usage_len] = 0;
                 new_param.value[value_len] = 0;
                 try new_tab.parameters.append(new_param);
             }
