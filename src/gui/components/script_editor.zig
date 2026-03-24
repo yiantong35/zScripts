@@ -108,6 +108,9 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
                 zgui.setWindowFontScale(detail_font_scale);
                 zgui.setNextItemWidth(-1);
                 _ = zgui.inputText("##description", .{ .buf = tab.description[0..511 :0] });
+                if (zgui.isItemActive()) {
+                    app_state.noteInputActivity();
+                }
                 zgui.setWindowFontScale(1.0);
                 zgui.popStyleVar(.{ .count = 1 });
             }
@@ -129,6 +132,9 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
                 zgui.setWindowFontScale(detail_font_scale);
                 zgui.setNextItemWidth(-1);
                 _ = zgui.inputText("##command", .{ .buf = tab.command[0..511 :0] });
+                if (zgui.isItemActive()) {
+                    app_state.noteInputActivity();
+                }
                 zgui.setWindowFontScale(1.0);
                 zgui.popStyleVar(.{ .count = 1 });
             }
@@ -158,7 +164,7 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
                 zgui.spacing();
                 const param_list_height = @max(74.0, zgui.getContentRegionAvail()[1] - 8.0);
                 if (zgui.beginChild("ParamList", .{ .w = -1, .h = param_list_height })) {
-                    renderParamList(tab, detail_font_scale);
+                    renderParamList(app_state, tab, detail_font_scale);
                 }
                 zgui.endChild();
             }
@@ -178,7 +184,7 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
     execution_view.render(app_state, tab, output_height, detail_font_scale);
 }
 
-fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
+fn renderParamList(app_state: *AppState, tab: *Tab, detail_font_scale: f32) void {
     const row_width = zgui.getContentRegionAvail()[0];
     const name_width = row_width * 0.22;
     const usage_width = row_width * 0.33;
@@ -206,6 +212,9 @@ fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
         const name_id = std.fmt.bufPrintZ(&name_id_buf, "##pname{d}", .{i}) catch "##pname";
         zgui.setNextItemWidth(name_width);
         _ = zgui.inputText(name_id, .{ .buf = param.name[0..127 :0] });
+        if (zgui.isItemActive()) {
+            app_state.noteInputActivity();
+        }
 
         zgui.sameLine(.{ .spacing = 8.0 });
         var usage_id_buf: [40:0]u8 = undefined;
@@ -215,6 +224,9 @@ fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
             .hint = "what this param does",
             .buf = param.usage[0..255 :0],
         });
+        if (zgui.isItemActive()) {
+            app_state.noteInputActivity();
+        }
         const usage_len = std.mem.indexOfScalar(u8, &param.usage, 0) orelse param.usage.len;
         if (usage_len > 0) {
             showItemTooltip(param.usage[0..usage_len]);
@@ -225,6 +237,9 @@ fn renderParamList(tab: *Tab, detail_font_scale: f32) void {
         const value_id = std.fmt.bufPrintZ(&value_id_buf, "##pval{d}", .{i}) catch "##pval";
         zgui.setNextItemWidth(value_width);
         _ = zgui.inputText(value_id, .{ .buf = param.value[0..255 :0] });
+        if (zgui.isItemActive()) {
+            app_state.noteInputActivity();
+        }
 
         zgui.sameLine(.{ .spacing = 8.0 });
         var remove_id_buf: [40:0]u8 = undefined;

@@ -18,6 +18,12 @@ fn handleSigint(_: c_int) callconv(.C) void {
 
 /// GLFW key callback：捕获 Cmd+数字 切换标签页
 fn handleKeyInput(_: *zglfw.Window, key: zglfw.Key, _: c_int, action: zglfw.Action, mods: zglfw.Mods) callconv(.c) void {
+    // 任何键盘活动都标记为输入活跃
+    if (global_app_state) |s| {
+        if (action == .press or action == .repeat) {
+            s.noteInputActivity();
+        }
+    }
     if (action != .press) return;
     if (!mods.super) return;
     const number_keys = [_]zglfw.Key{ .one, .two, .three, .four, .five, .six, .seven, .eight, .nine };
