@@ -1,6 +1,7 @@
 const std = @import("std");
 const script_mod = @import("script.zig");
 const max_output_bytes: usize = 2 * 1024 * 1024;
+const active_poll_grace_ms: i64 = 700;
 const CommandParseError = error{
     UnterminatedSingleQuote,
     UnterminatedDoubleQuote,
@@ -131,6 +132,7 @@ pub const ScriptExecutor = struct {
     allocator: std.mem.Allocator,
     child_process: ?std.process.Child,
     child_pgid: ?std.posix.pid_t,
+    active_poll_until_ms: i64,
     result: ExecutionResult,
 
     pub fn init(allocator: std.mem.Allocator) ScriptExecutor {
@@ -138,6 +140,7 @@ pub const ScriptExecutor = struct {
             .allocator = allocator,
             .child_process = null,
             .child_pgid = null,
+            .active_poll_until_ms = 0,
             .result = ExecutionResult.init(allocator),
         };
     }
@@ -222,6 +225,10 @@ pub const ScriptExecutor = struct {
         try self.result.appendOutput("\n\n");
     }
 
+    fn markActivePolling(self: *ScriptExecutor) void {
+        self.active_poll_until_ms = std.time.milliTimestamp() + active_poll_grace_ms;
+    }
+
     /// 执行脚本
     pub fn execute(self: *ScriptExecutor, script: *const script_mod.Script) !void {
         // 如果已有进程在运行，先停止
@@ -233,6 +240,7 @@ pub const ScriptExecutor = struct {
         self.result.clearOutput();
         self.result.status = .running;
         self.result.exit_code = null;
+        self.markActivePolling();
 
         const trimmed_command = std.mem.trim(u8, script.command, " \t\r\n");
         const basename = std.fs.path.basename(script.path);
@@ -309,6 +317,8 @@ pub const ScriptExecutor = struct {
     /// 检查进程状态并收集输出（非阻塞）
     pub fn poll(self: *ScriptExecutor) !void {
         if (self.child_process) |*child| {
+            var saw_activity = false;
+
             // 读取 stdout（非阻塞）
             if (child.stdout) |stdout| {
                 var buf: [4096]u8 = undefined;
@@ -318,6 +328,7 @@ pub const ScriptExecutor = struct {
                         return err;
                     };
                     if (n == 0) break;
+                    saw_activity = true;
                     try self.result.appendOutput(buf[0..n]);
                 }
             }
@@ -331,9 +342,14 @@ pub const ScriptExecutor = struct {
                         return err;
                     };
                     if (n == 0) break;
+                    saw_activity = true;
                     try self.result.appendOutput("[STDERR] ");
                     try self.result.appendOutput(buf[0..n]);
                 }
+            }
+
+            if (saw_activity) {
+                self.markActivePolling();
             }
 
             // 使用 waitpid 非阻塞检查进程状态
@@ -396,6 +412,7 @@ pub const ScriptExecutor = struct {
                 try self.result.appendOutput(msg);
             }
 
+            self.markActivePolling();
             self.child_process = null;
             self.child_pgid = null;
         }
@@ -441,6 +458,10 @@ pub const ScriptExecutor = struct {
     /// 是否正在运行
     pub fn isRunning(self: *const ScriptExecutor) bool {
         return self.result.status == .running;
+    }
+
+    pub fn prefersFrequentPolling(self: *const ScriptExecutor) bool {
+        return self.isRunning() and self.active_poll_until_ms > std.time.milliTimestamp();
     }
 };
 

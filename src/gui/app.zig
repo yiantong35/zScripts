@@ -5,6 +5,9 @@ const executor = @import("../core/executor.zig");
 const perf_monitor = @import("../core/perf_monitor.zig");
 const config = @import("../storage/config.zig");
 
+const quiet_running_script_poll_interval_s = 0.25;
+const active_running_script_poll_interval_s = 0.05;
+
 // 组件模块
 pub const home_page = @import("components/home_page.zig");
 pub const script_editor = @import("components/script_editor.zig");
@@ -299,6 +302,23 @@ pub const AppState = struct {
         return false;
     }
 
+    pub fn getRunningScriptPollIntervalSeconds(self: *const AppState) f64 {
+        if (self.active_tab_index < self.tabs.items.len) {
+            const active_tab = &self.tabs.items[self.active_tab_index];
+            if (active_tab.script_executor) |*exec| {
+                if (exec.isRunning()) return active_running_script_poll_interval_s;
+            }
+        }
+
+        for (self.tabs.items) |*tab| {
+            if (tab.script_executor) |*exec| {
+                if (exec.prefersFrequentPolling()) return active_running_script_poll_interval_s;
+            }
+        }
+
+        return quiet_running_script_poll_interval_s;
+    }
+
     pub fn setStartupMs(self: *AppState, startup_ms: f64) void {
         self.perf.setStartupMs(startup_ms);
     }
@@ -413,7 +433,48 @@ pub const AppState = struct {
         return self.config_manager.hasPendingWrites() or self.perf.needsTick() or self.hasActiveToast();
     }
 
+    pub fn pollRunningScripts(self: *AppState) void {
+        var needs_refresh = false;
+
+        for (self.tabs.items) |*tab| {
+            if (tab.script_executor) |*exec| {
+                if (!exec.isRunning()) continue;
+
+                const output_len_before = exec.getOutput().len;
+                exec.poll() catch |err| {
+                    std.debug.print("Poll error: {}\n", .{err});
+                    continue;
+                };
+                const output_len_after = exec.getOutput().len;
+
+                if (output_len_after != output_len_before) {
+                    needs_refresh = true;
+                }
+
+                if (!exec.isRunning()) {
+                    needs_refresh = true;
+
+                    if (tab.script_path) |path| {
+                        const cmd_len = std.mem.indexOfScalar(u8, &tab.command, 0) orelse tab.command.len;
+                        self.addHistoryEntry(
+                            path,
+                            tab.title,
+                            tab.command[0..cmd_len],
+                            exec.result.exit_code,
+                            exec.result.status == .completed and (exec.result.exit_code orelse 1) == 0,
+                        );
+                    }
+                }
+            }
+        }
+
+        if (needs_refresh and !self.hasRunningScript()) {
+            self.requestExtraFrames(2);
+        }
+    }
+
     pub fn flushBackgroundTasks(self: *AppState) void {
+        self.pollRunningScripts();
         self.config_manager.flushPendingWrites(false) catch |err| {
             std.debug.print("flush config failed: {}\n", .{err});
         };

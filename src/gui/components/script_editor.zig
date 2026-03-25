@@ -27,29 +27,6 @@ pub fn render(app_state: *AppState, tab: *Tab) void {
         .col = bg_color,
     });
 
-    if (tab.script_executor) |*exec| {
-        var mut_exec = exec.*;
-        if (mut_exec.isRunning()) {
-            mut_exec.poll() catch |err| {
-                std.debug.print("Poll error: {}\n", .{err});
-            };
-            // 执行刚结束 → 记录历史
-            if (!mut_exec.isRunning()) {
-                if (tab.script_path) |path| {
-                    const cmd_len = std.mem.indexOfScalar(u8, &tab.command, 0) orelse tab.command.len;
-                    app_state.addHistoryEntry(
-                        path,
-                        tab.title,
-                        tab.command[0..cmd_len],
-                        mut_exec.result.exit_code,
-                        mut_exec.result.status == .completed and (mut_exec.result.exit_code orelse 1) == 0,
-                    );
-                }
-            }
-            tab.script_executor = mut_exec;
-        }
-    }
-
     const avail = zgui.getContentRegionAvail();
     const control_ratio: f32 = 0.42;
     const min_control_h: f32 = 250.0;

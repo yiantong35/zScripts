@@ -178,7 +178,9 @@ pub fn main() !void {
         } else if (window_focused and app_state.needsInteractiveIdleRedraw()) {
             // 触摸板轻点/双指点击后保留一个很短的活跃窗口，确保延迟 UI 状态能落到屏幕上
             zglfw.waitEventsTimeout(0.016);
-        } else if (app_state.hasRunningScript() or app_state.needsBackgroundTick()) {
+        } else if (app_state.hasRunningScript()) {
+            zglfw.waitEventsTimeout(app_state.getRunningScriptPollIntervalSeconds());
+        } else if (app_state.needsBackgroundTick()) {
             zglfw.waitEventsTimeout(0.05);
         } else {
             zglfw.waitEvents();
